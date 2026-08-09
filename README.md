@@ -228,19 +228,29 @@ confirm the D11/D12/D13 mapping instead of trusting the documentation, and does
 a static pull-up/pull-down test on MISO that detects a line being held low —
 which SPI traffic alone cannot distinguish from a silent card.
 
-**If the probe reports `R1 = 0x01`**, the stock `SD` library is the problem.
-This is a known failure mode on the mbed cores. Install **SdFat** (Bill
-Greiman, v2) via Library Manager and use:
+**If the probe reports `R1 = 0x01`**, the stock `SD` library is the problem, and
+switching to **SdFat** (Bill Greiman, v2) is the fix.
 
-```cpp
-#include <SdFat.h>
-SdFat SD;
-SD.begin(SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(4)));
-```
+> **Do not paste SdFat into the diagnostic sketches.** `SdDiagnostic` exists to
+> test the stock SD library's layers and is built on `Sd2Card`/`SdVolume`, which
+> SdFat v2 does not have. `SdRawProbe` uses no SD library at all, by design.
+> Both now `#error` with a readable message rather than emitting a wall of
+> confusing type errors. The SdFat change applies to
+> `WasherVibeLogger.ino` **only**, and it is a small port, not a paste-in:
+>
+> - `#include <SdFat.h>` replaces `#include <SD.h>`, plus `SdFat SD;`
+> - `SD.begin(SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(4)))` replaces
+>   `SD.begin(SD_CS_PIN)` — inside `initSd()`, not at file scope
+> - `reportSdFailure()` must be dropped or rewritten: its `Sd2Card`/`SdVolume`
+>   layer probe has no SdFat v2 equivalent
+>
+> Everything else the logger calls (`open`, `exists`, `write`, `flush`,
+> `close`, `openNextFile`) is API-compatible.
 
-SdFat is API-compatible with the `SD` calls this firmware makes (`open`,
-`exists`, `write`, `flush`, `close`, `openNextFile`), so only the include and
-the `begin()` line change.
+Note that installing SdFat alongside SD also **redefines `F()`** as a plain
+string on non-AVR targets. Any code that types a variable or parameter as
+`const __FlashStringHelper *` stops compiling as soon as SdFat is on the
+include path — worth knowing if you add debug helpers of your own.
 
 **If layer 1 fails, the most likely cause is power, not signal wiring.** A "5 V"
 SD module with an onboard 3.3 V regulator needs **5 V on VCC** (take it from the

@@ -44,6 +44,14 @@
 #include <string.h>
 #include <strings.h>   /* strcasecmp / strncasecmp */
 
+/* Built against the Arduino SD library, whose Sd2Card/SdVolume classes the
+ * failure diagnostics use. SdFat v2 renamed those (SdCard/FsVolume) and also
+ * redefines F(), so it is not a drop-in here — porting to SdFat means changing
+ * reportSdFailure() as well as the include. See the README. */
+#if !defined(SD_CARD_TYPE_SD1)
+#error "Install the Arduino SD library (Library Manager -> 'SD' by Arduino). This sketch does not build against SdFat v2 as-is."
+#endif
+
 /* ==========================================================================
  * TUNING CONSTANTS — the knobs you will actually touch during testing
  * ========================================================================== */

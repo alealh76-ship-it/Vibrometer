@@ -19,7 +19,11 @@
  * Upload, open Serial Monitor at 115200. Send any character to re-run.
  */
 
+/* NO SD LIBRARY IS INVOLVED — only SPI. That is the entire point: this sketch
+ * is unaffected by which SD library you have installed, or whether it works.
+ * Do not add SD.h or SdFat.h here. */
 #include <SPI.h>
+#include <string.h>
 
 #define SD_CS_PIN 10
 

@@ -14,8 +14,17 @@
  * Upload, open Serial Monitor at 115200. Send any character to re-run.
  */
 
+/* !! DO NOT add SdFat to this sketch. !!
+ * The whole point of this file is to test the STOCK Arduino SD library one
+ * layer at a time. It needs SD.h's Sd2Card/SdVolume classes, which SdFat v2
+ * does not have (it renamed them SdCard/FsVolume). If you want to try SdFat,
+ * that change belongs in WasherVibeLogger.ino — see the README. */
 #include <SPI.h>
 #include <SD.h>
+
+#if !defined(SD_CARD_TYPE_SD1)
+#error "This sketch requires the Arduino SD library (Library Manager -> 'SD' by Arduino). It cannot be built against SdFat v2 — see the comment above."
+#endif
 
 #define SD_CS_PIN 10     /* must match WasherVibeLogger */
 
@@ -25,7 +34,10 @@ Sd2Card  card;
 SdVolume volume;
 SdFile   root;
 
-static bool tryCard(uint8_t speed, const __FlashStringHelper *label) {
+/* Plain const char*, deliberately not const __FlashStringHelper*: SdFat
+ * redefines F() as a no-op on non-AVR targets, so a parameter typed on that
+ * macro stops compiling the moment SdFat is installed alongside SD. */
+static bool tryCard(uint8_t speed, const char *label) {
   Serial.print(F("  trying "));
   Serial.print(label);
   Serial.print(F(" ... "));
@@ -52,10 +64,10 @@ static void runDiagnostic() {
   /* ---------------- LAYER 1: SPI + card handshake ------------------------ */
   Serial.println(F("[LAYER 1] SPI / card handshake"));
 
-  bool ok = tryCard(SPI_HALF_SPEED, F("half speed"));
+  bool ok = tryCard(SPI_HALF_SPEED, "half speed");
   bool neededSlowClock = false;
   if (!ok) {
-    ok = tryCard(SPI_QUARTER_SPEED, F("quarter speed"));
+    ok = tryCard(SPI_QUARTER_SPEED, "quarter speed");
     neededSlowClock = ok;
   }
 
