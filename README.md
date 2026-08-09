@@ -15,16 +15,32 @@ Sketch: [`WasherVibeLogger/WasherVibeLogger.ino`](WasherVibeLogger/WasherVibeLog
 
 ## Hardware / wiring
 
-SPI is fixed on the Nano 33 BLE; only CS is your choice.
+> **Do not wire SPI from a pinout diagram — including from an earlier version of
+> this file, which had it wrong.** The authoritative source is the board variant
+> itself. The logger prints the mapping at boot:
+>
+> ```
+> [CFG] SPI per the board variant: MOSI=Dxx MISO=Dxx SCK=Dxx SS=Dxx
+> ```
+>
+> `SdRawProbe` prints the same thing. Wire the module to those numbers. This
+> cost a long debugging detour once already; thirty seconds of reading the
+> banner avoids repeating it.
 
 | SD module | Nano 33 BLE Sense | Note |
 |---|---|---|
-| MOSI | D11 | fixed |
-| MISO | D12 | fixed |
-| SCK  | D13 | fixed |
+| MOSI (module `DI`) | *see boot banner* | fixed by the variant |
+| MISO (module `DO`) | *see boot banner* | fixed by the variant |
+| SCK | *see boot banner* | fixed by the variant |
 | CS   | D10 | configurable — `#define SD_CS_PIN` |
 | VCC  | 3.3V *or* 5V | see warning below |
 | GND  | GND | |
+
+Note the module-side names: **`DI` and `DO` are named from the card's point of
+view**, so `DI` goes to MOSI and `DO` goes to MISO. Modules that label them
+`MOSI`/`MISO` instead are already host-relative. Getting this backwards produces
+exactly the same symptom as a wrong pin number — a CMD0 timeout with no
+response.
 
 > **3.3 V warning.** The Nano 33 BLE is a 3.3 V board and its GPIO is **not 5 V
 > tolerant**. Use a microSD breakout that is 3.3 V-native, or a 5 V module whose
@@ -32,8 +48,9 @@ SPI is fixed on the Nano 33 BLE; only CS is your choice.
 > modules only shift the inputs and drive MISO at 5 V, which will slowly damage
 > the nRF52840). If in doubt, power the module from the board's 3V3 pin.
 
-> **D13 conflict.** D13 is SCK, so `LED_BUILTIN` is unusable once the SD card is
-> wired. That is why all status indication uses the onboard RGB LED.
+> **LED_BUILTIN conflict.** SCK shares a pin with `LED_BUILTIN` on this board,
+> so `LED_BUILTIN` is unusable once the SD card is wired. That is why all status
+> indication uses the onboard RGB LED.
 
 Power is USB 5 V for now. Card must be FAT16/FAT32 formatted.
 
@@ -139,9 +156,9 @@ The three counters are the ones to watch:
 
 **1. SD CS pin / wiring.** Set to **D10** (`SD_CS_PIN`), which is the
 conventional choice and clashes with nothing on this board. MOSI/MISO/SCK are
-fixed at D11/D12/D13 as in the table above. Change only `SD_CS_PIN` if your
-breakout is wired elsewhere. The thing actually worth double-checking is not the
-CS pin but the **3.3 V level-shifting on MISO** — see the warning above.
+fixed by the board variant and printed in the boot banner — use those numbers.
+Change only `SD_CS_PIN` if your breakout is wired elsewhere. Also worth
+double-checking: the **3.3 V level-shifting on MISO** — see the warning above.
 
 **2. Is 100 Hz achievable?** Yes, with one caveat that is about the IMU, not the
 SD card.
@@ -218,39 +235,32 @@ hand with **no SD library involved** and prints the raw bytes on MISO:
 
 | Probe result | Meaning |
 |---|---|
-| `R1 = 0x01` | **card works** — the SD library is the fault, switch to SdFat |
+| `R1 = 0x01` | **card and wiring are fine** — go back to the logger |
 | all `0xFF` | nothing answering — power, CS, or SCK/MOSI not arriving |
 | all `0x00` | MISO held low — miswired, shorted, or module unpowered |
 | mixture | partial comms — signal integrity, shorten the wires |
 
 It also prints the core's real `MOSI`/`MISO`/`SCK`/`SS` pin numbers, so you can
-confirm the D11/D12/D13 mapping instead of trusting the documentation, and does
+confirm the real pin mapping instead of trusting any documentation, and does
 a static pull-up/pull-down test on MISO that detects a line being held low —
 which SPI traffic alone cannot distinguish from a silent card.
 
-**If the probe reports `R1 = 0x01`**, the stock `SD` library is the problem, and
-switching to **SdFat** (Bill Greiman, v2) is the fix.
+**If the probe reports `R1 = 0x01`**, the card and wiring are fine — go straight
+back to `WasherVibeLogger`. The stock `SD` library is only a suspect if
+`SD.begin()` still fails *after* the raw probe succeeds, which is rare.
 
-> **Do not paste SdFat into the diagnostic sketches.** `SdDiagnostic` exists to
-> test the stock SD library's layers and is built on `Sd2Card`/`SdVolume`, which
-> SdFat v2 does not have. `SdRawProbe` uses no SD library at all, by design.
-> Both now `#error` with a readable message rather than emitting a wall of
-> confusing type errors. The SdFat change applies to
-> `WasherVibeLogger.ino` **only**, and it is a small port, not a paste-in:
->
-> - `#include <SdFat.h>` replaces `#include <SD.h>`, plus `SdFat SD;`
-> - `SD.begin(SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(4)))` replaces
->   `SD.begin(SD_CS_PIN)` — inside `initSd()`, not at file scope
-> - `reportSdFailure()` must be dropped or rewritten: its `Sd2Card`/`SdVolume`
->   layer probe has no SdFat v2 equivalent
->
-> Everything else the logger calls (`open`, `exists`, `write`, `flush`,
-> `close`, `openNextFile`) is API-compatible.
+> **Historical note.** During the first debugging round this project suspected
+> the SD library and recommended switching to SdFat. That was wrong: the actual
+> fault was **an incorrect SPI pin mapping in this README**. Stay on the stock
+> Arduino `SD` library. If you installed SdFat while chasing this, uninstall it
+> or drop back to `SD` 1.2.4 — SdFat v2 also takes over `<SD.h>`, renames
+> `Sd2Card`/`SdVolume` to `SdCard`/`FsVolume`, and redefines `F()` as a plain
+> string on non-AVR targets, which breaks `SdDiagnostic` and any code typed on
+> `const __FlashStringHelper *`.
 
-Note that installing SdFat alongside SD also **redefines `F()`** as a plain
-string on non-AVR targets. Any code that types a variable or parameter as
-`const __FlashStringHelper *` stops compiling as soon as SdFat is on the
-include path — worth knowing if you add debug helpers of your own.
+`WasherVibeLogger` builds against either library — the layer probe compiles out
+when the classic classes are absent. `SdDiagnostic` needs the classic `SD`
+library and says so with a readable `#error`.
 
 **If layer 1 fails, the most likely cause is power, not signal wiring.** A "5 V"
 SD module with an onboard 3.3 V regulator needs **5 V on VCC** (take it from the

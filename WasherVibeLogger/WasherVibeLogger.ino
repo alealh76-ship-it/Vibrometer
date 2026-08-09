@@ -28,12 +28,15 @@
  *                 and it is fully recomputable offline from ax/ay/az.
  *
  * Wiring (SPI pins are fixed on the Nano 33 BLE; only CS is your choice)
- *   SD MOSI -> D11    SD MISO -> D12    SD SCK -> D13    SD CS -> D10
+ *   SD CS -> D10 (SD_CS_PIN). MOSI/MISO/SCK are fixed by the board variant
+ *   and are PRINTED AT BOOT — wire to those numbers, not to a diagram.
+ *   Module DI -> MOSI, module DO -> MISO (DI/DO are card-relative names).
  *   SD VCC  -> see README: the Nano 33 BLE is a 3.3 V board and is NOT 5 V
  *              tolerant. Use a 3.3 V-native microSD breakout, or a 5 V module
  *              whose level shifter also shifts MISO back down to 3.3 V.
- *   NOTE: D13 is SCK here, so LED_BUILTIN is unusable while the SD card is
- *         wired. That is why all status indication uses the onboard RGB LED.
+ *   NOTE: SCK shares a pin with LED_BUILTIN on this board, so LED_BUILTIN is
+ *         unusable while the SD card is wired. That is why all status
+ *         indication uses the onboard RGB LED.
  */
 
 #include <Arduino_LSM9DS1.h>
@@ -681,6 +684,20 @@ void setup() {
   Serial.print(F(" g quiet_timeout="));      Serial.print(QUIET_TIMEOUT_MS / 1000UL);
   Serial.print(F(" s range=+/-"));           Serial.print(ACCEL_RANGE_G);
   Serial.print(F(" g cs=D"));                Serial.println(SD_CS_PIN);
+
+  /* Print the SPI mapping the core actually uses instead of trusting a pinout
+   * diagram. These macros come from the board variant, so they are correct by
+   * construction — wire the SD module to THESE numbers. */
+  Serial.print(F("[CFG] SPI per the board variant: MOSI=D"));
+  Serial.print(MOSI);
+  Serial.print(F(" MISO=D"));
+  Serial.print(MISO);
+  Serial.print(F(" SCK=D"));
+  Serial.print(SCK);
+  Serial.print(F(" SS=D"));
+  Serial.println(SS);
+  Serial.println(F("      Module DI->MOSI, DO->MISO (DI/DO are named from the"));
+  Serial.println(F("      card's point of view, so they are easy to swap)."));
 
   if (!IMU.begin()) {
     Serial.println(F("[IMU] init FAILED"));

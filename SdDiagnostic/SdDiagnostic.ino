@@ -65,7 +65,12 @@ static void runDiagnostic() {
   Serial.println(F("================ SD DIAGNOSTIC ================"));
   Serial.print(F("CS pin: D"));
   Serial.println(SD_CS_PIN);
-  Serial.println(F("Fixed SPI pins on this board: MOSI=D11 MISO=D12 SCK=D13"));
+  Serial.print(F("SPI per the board variant: MOSI=D"));
+  Serial.print(MOSI);
+  Serial.print(F(" MISO=D"));
+  Serial.print(MISO);
+  Serial.print(F(" SCK=D"));
+  Serial.println(SCK);
   Serial.println();
 
   /* ---------------- LAYER 1: SPI + card handshake ------------------------ */

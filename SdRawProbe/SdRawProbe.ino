@@ -14,7 +14,7 @@
  *   mixture   -> partial comms, clocking or signal integrity
  *
  * It also prints the core's real pin numbers for MOSI/MISO/SCK/SS, so you can
- * confirm the D11/D12/D13 assumption rather than trusting the docs.
+ * confirm the real mapping rather than trusting any documentation.
  *
  * Upload, open Serial Monitor at 115200. Send any character to re-run.
  */
@@ -39,8 +39,9 @@ static void reportPins() {
   Serial.print(F("  SCK  = D"));  Serial.println(SCK);
   Serial.print(F("  SS   = D"));  Serial.println(SS);
   Serial.print(F("  CS in use = D")); Serial.println(SD_CS_PIN);
-  Serial.println(F("  Expected on Nano 33 BLE: MOSI=11 MISO=12 SCK=13."));
-  Serial.println(F("  If these differ, rewire to match THESE numbers."));
+  Serial.println(F("  These come from the board variant and are authoritative."));
+  Serial.println(F("  Wire the module to THESE numbers — do not trust a pinout"));
+  Serial.println(F("  diagram or this project's docs over this line."));
   Serial.println();
 }
 
@@ -141,8 +142,8 @@ static void runProbe() {
   if (r1 == 0x01) {
     Serial.println(F("*** CMD0 SUCCEEDED (R1 = 0x01, card is in idle state)."));
     Serial.println(F("*** THE CARD AND WIRING ARE FINE."));
-    Serial.println(F("*** The stock SD library is what is failing. Switch to"));
-    Serial.println(F("*** the SdFat library (see README)."));
+    Serial.println(F("*** Go run WasherVibeLogger. Only if the SD library still"));
+    Serial.println(F("*** fails from here is the library itself a suspect."));
 
     /* Go one step further: CMD8 tells us the card's voltage support. */
     uint8_t t8[10];
@@ -163,7 +164,8 @@ static void runProbe() {
     Serial.println(F("*** The card is not driving the bus. Check, in order:"));
     Serial.println(F("***  1. VCC AT THE MODULE, measured with a meter while"));
     Serial.println(F("***     powered. Continuity does not prove voltage."));
-    Serial.println(F("***  2. MISO on the wrong pin (must be D12 above)."));
+    Serial.println(F("***  2. MISO on the wrong pin — use the MISO number"));
+    Serial.println(F("***     printed above, not one from a pinout diagram."));
     Serial.println(F("***  3. MOSI and MISO swapped."));
   } else if (allFF) {
     Serial.println(F("*** NOTHING IS ANSWERING (line idle high the whole time)."));
