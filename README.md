@@ -205,6 +205,43 @@ two partitions, that's the place to look first:
 - It supports **SD/SDHC up to 32 GB only** — SDXC (64 GB+) is not supported at
   all, regardless of how it's formatted. The diagnostic prints the capacity.
 
+### Layer 1 keeps failing (errorCode 0x1) after swapping modules and cards
+
+`errorCode 0x1` is `SD_CARD_ERROR_CMD0`: the card never answered the first
+command. (`data 0x0` is not meaningful — the CMD0 path doesn't populate
+`errorData`, so it reads back its initial value.)
+
+If that survives swapping modules and cards and a continuity check, the fault is
+no longer in the module, the card, or the copper. Run
+[`SdRawProbe/SdRawProbe.ino`](SdRawProbe/SdRawProbe.ino), which drives SPI by
+hand with **no SD library involved** and prints the raw bytes on MISO:
+
+| Probe result | Meaning |
+|---|---|
+| `R1 = 0x01` | **card works** — the SD library is the fault, switch to SdFat |
+| all `0xFF` | nothing answering — power, CS, or SCK/MOSI not arriving |
+| all `0x00` | MISO held low — miswired, shorted, or module unpowered |
+| mixture | partial comms — signal integrity, shorten the wires |
+
+It also prints the core's real `MOSI`/`MISO`/`SCK`/`SS` pin numbers, so you can
+confirm the D11/D12/D13 mapping instead of trusting the documentation, and does
+a static pull-up/pull-down test on MISO that detects a line being held low —
+which SPI traffic alone cannot distinguish from a silent card.
+
+**If the probe reports `R1 = 0x01`**, the stock `SD` library is the problem.
+This is a known failure mode on the mbed cores. Install **SdFat** (Bill
+Greiman, v2) via Library Manager and use:
+
+```cpp
+#include <SdFat.h>
+SdFat SD;
+SD.begin(SdSpiConfig(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(4)));
+```
+
+SdFat is API-compatible with the `SD` calls this firmware makes (`open`,
+`exists`, `write`, `flush`, `close`, `openNextFile`), so only the include and
+the `begin()` line change.
+
 **If layer 1 fails, the most likely cause is power, not signal wiring.** A "5 V"
 SD module with an onboard 3.3 V regulator needs **5 V on VCC** (take it from the
 Nano's 5V pin, which is live when USB-powered). Fed from 3V3, its regulator
