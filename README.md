@@ -15,32 +15,34 @@ Sketch: [`WasherVibeLogger/WasherVibeLogger.ino`](WasherVibeLogger/WasherVibeLog
 
 ## Hardware / wiring
 
-> **Do not wire SPI from a pinout diagram — including from an earlier version of
-> this file, which had it wrong.** The authoritative source is the board variant
-> itself. The logger prints the mapping at boot:
->
-> ```
-> [CFG] SPI per the board variant: MOSI=Dxx MISO=Dxx SCK=Dxx SS=Dxx
-> ```
->
-> `SdRawProbe` prints the same thing. Wire the module to those numbers. This
-> cost a long debugging detour once already; thirty seconds of reading the
-> banner avoids repeating it.
+SPI is fixed on the Nano 33 BLE; only CS is your choice.
 
 | SD module | Nano 33 BLE Sense | Note |
 |---|---|---|
-| MOSI (module `DI`) | *see boot banner* | fixed by the variant |
-| MISO (module `DO`) | *see boot banner* | fixed by the variant |
-| SCK | *see boot banner* | fixed by the variant |
+| MOSI (or `DI`) | D11 | fixed |
+| MISO (or `DO`) | D12 | fixed |
+| SCK  | D13 | fixed |
 | CS   | D10 | configurable — `#define SD_CS_PIN` |
 | VCC  | 3.3V *or* 5V | see warning below |
 | GND  | GND | |
 
-Note the module-side names: **`DI` and `DO` are named from the card's point of
-view**, so `DI` goes to MOSI and `DO` goes to MISO. Modules that label them
-`MOSI`/`MISO` instead are already host-relative. Getting this backwards produces
-exactly the same symptom as a wrong pin number — a CMD0 timeout with no
-response.
+The board confirms the left column at boot, read straight from the variant
+macros, so you never have to take this table on faith:
+
+```
+[CFG] SPI per the board variant: MOSI=D11 MISO=D12 SCK=D13 SS=D10
+```
+
+> **Check the module's own pin labels before wiring — this is the one that
+> bites.** Many microSD breakouts print their labels on the **underside only**,
+> and the pin *order* is not standardised between module types. Wiring by
+> position, from another module, or from a stock photo gives you a silent CMD0
+> timeout that looks exactly like a dead card. Pull the module off the
+> protoboard and read the silkscreen.
+>
+> Where a module uses `DI`/`DO`, those names are from the **card's** point of
+> view: `DI` → MOSI (D11), `DO` → MISO (D12). Modules labelled `MOSI`/`MISO`
+> are already host-relative and connect straight across.
 
 > **3.3 V warning.** The Nano 33 BLE is a 3.3 V board and its GPIO is **not 5 V
 > tolerant**. Use a microSD breakout that is 3.3 V-native, or a 5 V module whose
@@ -156,9 +158,11 @@ The three counters are the ones to watch:
 
 **1. SD CS pin / wiring.** Set to **D10** (`SD_CS_PIN`), which is the
 conventional choice and clashes with nothing on this board. MOSI/MISO/SCK are
-fixed by the board variant and printed in the boot banner — use those numbers.
-Change only `SD_CS_PIN` if your breakout is wired elsewhere. Also worth
-double-checking: the **3.3 V level-shifting on MISO** — see the warning above.
+fixed at **D11/D12/D13**, and the boot banner echoes them from the variant
+macros so you can confirm rather than assume. Change only `SD_CS_PIN` if your
+breakout is wired elsewhere. Two things worth double-checking on the *module*
+side: its pin labels (often silkscreened underneath) and the **3.3 V
+level-shifting on MISO** — see the warnings above.
 
 **2. Is 100 Hz achievable?** Yes, with one caveat that is about the IMU, not the
 SD card.
@@ -251,7 +255,9 @@ back to `WasherVibeLogger`. The stock `SD` library is only a suspect if
 
 > **Historical note.** During the first debugging round this project suspected
 > the SD library and recommended switching to SdFat. That was wrong: the actual
-> fault was **an incorrect SPI pin mapping in this README**. Stay on the stock
+> fault was **the SD module's pins being wired from the wrong map**, because its
+> labels are silkscreened on the underside where they are easy to miss. The
+> board-side D11/D12/D13 mapping above was correct all along. Stay on the stock
 > Arduino `SD` library. If you installed SdFat while chasing this, uninstall it
 > or drop back to `SD` 1.2.4 — SdFat v2 also takes over `<SD.h>`, renames
 > `Sd2Card`/`SdVolume` to `SdCard`/`FsVolume`, and redefines `F()` as a plain

@@ -39,9 +39,11 @@ static void reportPins() {
   Serial.print(F("  SCK  = D"));  Serial.println(SCK);
   Serial.print(F("  SS   = D"));  Serial.println(SS);
   Serial.print(F("  CS in use = D")); Serial.println(SD_CS_PIN);
-  Serial.println(F("  These come from the board variant and are authoritative."));
-  Serial.println(F("  Wire the module to THESE numbers — do not trust a pinout"));
-  Serial.println(F("  diagram or this project's docs over this line."));
+  Serial.println(F("  These come from the board variant, so they are correct"));
+  Serial.println(F("  by construction. Expected: MOSI=11 MISO=12 SCK=13."));
+  Serial.println(F("  If they match, the BOARD side is fine and any wiring"));
+  Serial.println(F("  fault is on the MODULE side — check its silkscreen, which"));
+  Serial.println(F("  on many breakouts is on the underside only."));
   Serial.println();
 }
 

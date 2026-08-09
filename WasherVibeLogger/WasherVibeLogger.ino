@@ -28,9 +28,15 @@
  *                 and it is fully recomputable offline from ax/ay/az.
  *
  * Wiring (SPI pins are fixed on the Nano 33 BLE; only CS is your choice)
- *   SD CS -> D10 (SD_CS_PIN). MOSI/MISO/SCK are fixed by the board variant
- *   and are PRINTED AT BOOT — wire to those numbers, not to a diagram.
- *   Module DI -> MOSI, module DO -> MISO (DI/DO are card-relative names).
+ *   SD MOSI -> D11    SD MISO -> D12    SD SCK -> D13    SD CS -> D10
+ *   The board also prints this mapping at boot, straight from the variant
+ *   macros, so you can confirm it rather than trust this comment.
+ *
+ *   CHECK THE MODULE'S OWN PIN LABELS FIRST. Many microSD breakouts print
+ *   them on the UNDERSIDE only, and the pin ORDER differs between module
+ *   types — do not infer it from another module or a stock photo. Note also
+ *   that DI/DO, where used, are named from the card's point of view:
+ *   DI -> MOSI (D11), DO -> MISO (D12).
  *   SD VCC  -> see README: the Nano 33 BLE is a 3.3 V board and is NOT 5 V
  *              tolerant. Use a 3.3 V-native microSD breakout, or a 5 V module
  *              whose level shifter also shifts MISO back down to 3.3 V.
