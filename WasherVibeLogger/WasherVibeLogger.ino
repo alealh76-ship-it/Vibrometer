@@ -44,12 +44,16 @@
 #include <string.h>
 #include <strings.h>   /* strcasecmp / strncasecmp */
 
-/* Built against the Arduino SD library, whose Sd2Card/SdVolume classes the
- * failure diagnostics use. SdFat v2 renamed those (SdCard/FsVolume) and also
- * redefines F(), so it is not a drop-in here — porting to SdFat means changing
- * reportSdFailure() as well as the include. See the README. */
-#if !defined(SD_CARD_TYPE_SD1)
-#error "Install the Arduino SD library (Library Manager -> 'SD' by Arduino). This sketch does not build against SdFat v2 as-is."
+/* The layer-by-layer failure probe further down uses Sd2Card/SdVolume, which
+ * exist in the classic Arduino SD library (1.2.x). SdFat v2 — and SD 1.3.x,
+ * which is built on top of it — renamed them to SdCard/FsVolume. Detect which
+ * one we got and degrade gracefully rather than refusing to build: the logger
+ * itself only needs begin/open/write/flush/close, and must never fail to
+ * compile over a diagnostic convenience. */
+#if defined(SD_CARD_TYPE_SD1)
+#define HAVE_SD_LAYER_PROBE 1
+#else
+#define HAVE_SD_LAYER_PROBE 0
 #endif
 
 /* ==========================================================================
@@ -389,6 +393,14 @@ static uint16_t highestLogIndex() {
  * we re-run the layers individually and say which one actually broke.
  * Only runs on the failure path — it costs nothing when the card works. */
 static void reportSdFailure() {
+#if !HAVE_SD_LAYER_PROBE
+  /* SdFat-based SD library: no Sd2Card/SdVolume to probe with. */
+  Serial.println(F("[SD ] init failed. The layer-by-layer probe needs the"));
+  Serial.println(F("      classic Arduino SD library and this build has the"));
+  Serial.println(F("      SdFat-based one, so run SdRawProbe.ino instead —"));
+  Serial.println(F("      it uses no SD library at all and reports the raw"));
+  Serial.println(F("      bytes the card puts on MISO."));
+#else
   Sd2Card  card;
   SdVolume volume;
 
@@ -461,6 +473,7 @@ static void reportSdFailure() {
   Serial.println(volume.fatType());
   Serial.println(F("[SD ] LAYER 3 (root directory) is the remaining suspect —"));
   Serial.println(F("      the filesystem is probably corrupt; reformat."));
+#endif  /* HAVE_SD_LAYER_PROBE */
 }
 
 static bool initSd() {

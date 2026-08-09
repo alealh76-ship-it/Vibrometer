@@ -22,8 +22,15 @@
 #include <SPI.h>
 #include <SD.h>
 
+/* If this fires, <SD.h> resolved to the SdFat-based library (SdFat v2, or SD
+ * 1.3.x which is built on it) rather than the classic one. Either:
+ *   - uninstall SdFat / downgrade SD to 1.2.4 in Library Manager, or
+ *   - skip this sketch entirely and run SdRawProbe.ino, which needs no SD
+ *     library and gives a strictly more direct answer.
+ * You do NOT need this sketch twice: once it has told you which layer fails,
+ * its job is done. */
 #if !defined(SD_CARD_TYPE_SD1)
-#error "This sketch requires the Arduino SD library (Library Manager -> 'SD' by Arduino). It cannot be built against SdFat v2 — see the comment above."
+#error "SD.h here is the SdFat-based library, which has no Sd2Card/SdVolume. Run SdRawProbe.ino instead (it needs no SD library), or install SD 1.2.4."
 #endif
 
 #define SD_CS_PIN 10     /* must match WasherVibeLogger */
