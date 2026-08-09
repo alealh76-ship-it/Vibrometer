@@ -178,6 +178,44 @@ If the clip counter comes back non-zero after a spin cycle, set
 range halves the resolution, and resolution is what you want for characterising
 quiet pauses.
 
+## Troubleshooting: "SD init FAILED"
+
+`SD.begin()` returns a single `false` for three unrelated failures, which is
+why the first version of this firmware couldn't tell you anything useful. It now
+re-runs the layers individually on failure and reports which one broke. Upload
+[`SdDiagnostic/SdDiagnostic.ino`](SdDiagnostic/SdDiagnostic.ino) for the same
+breakdown with no logger code involved at all.
+
+| Layer that fails | What it means | Where to look |
+|---|---|---|
+| **1 — SPI / card handshake** | card never responded | power, CS, MOSI/MISO swap, wire length |
+| **2 — FAT volume** | card talks fine, **wiring is good** | partition table, exFAT/GPT, card >32 GB |
+| **3 — root directory** | volume mounts, directory won't open | corrupt filesystem, reformat |
+
+**If layer 2 fails, stop checking the wiring** — the card answered, so the wiring
+is proven. Layer 2 failures are formatting, and given a card that recently had
+two partitions, that's the place to look first:
+
+- The library reads **MBR partition slot 1 only.** If your FAT32 volume ended up
+  in slot 2, `SD.begin()` fails even though the card mounts fine on a PC. The
+  diagnostic prints all four slots so you can see this directly.
+- It **cannot read GPT.** Some partition tools default to GPT; a GPT card looks
+  formatted on a PC and is invisible here.
+- It **cannot read exFAT.** Windows picks exFAT by default for cards >32 GB.
+- It supports **SD/SDHC up to 32 GB only** — SDXC (64 GB+) is not supported at
+  all, regardless of how it's formatted. The diagnostic prints the capacity.
+
+**If layer 1 fails, the most likely cause is power, not signal wiring.** A "5 V"
+SD module with an onboard 3.3 V regulator needs **5 V on VCC** (take it from the
+Nano's 5V pin, which is live when USB-powered). Fed from 3V3, its regulator
+drops below the card's minimum and the card silently never enumerates — which
+looks exactly like a wiring fault. A 3.3 V-native module wants 3V3. Check which
+one you have before re-checking the jumpers.
+
+The diagnostic also retries at a slower SPI clock. If it only works slow, that's
+signal integrity: shorten the jumpers to under ~10 cm. Don't ignore it — it can
+init at boot and then corrupt data later at full logging rate.
+
 ## Known limitations
 
 - No pre-trigger buffer — the first `TRIGGER_CONFIRM_MS` of a cycle's onset is

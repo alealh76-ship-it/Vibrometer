@@ -375,9 +375,96 @@ static uint16_t highestLogIndex() {
   return highest;
 }
 
+/* SD.begin() collapses three completely different failures into one `false`:
+ * the SPI/card handshake, mounting the FAT volume, and opening the root dir.
+ * Those have opposite fixes (wiring vs. formatting), so on the first failure
+ * we re-run the layers individually and say which one actually broke.
+ * Only runs on the failure path — it costs nothing when the card works. */
+static void reportSdFailure() {
+  Sd2Card  card;
+  SdVolume volume;
+
+  Serial.println(F("[SD ] ---- init failure detail ----"));
+
+  bool cardOk = card.init(SPI_HALF_SPEED, SD_CS_PIN);
+  if (!cardOk) {
+    Serial.print(F("[SD ] LAYER 1 (SPI / card handshake) FAILED, errorCode=0x"));
+    Serial.println(card.errorCode(), HEX);
+    Serial.println(F("      retrying at quarter SPI speed..."));
+    cardOk = card.init(SPI_QUARTER_SPEED, SD_CS_PIN);
+    if (cardOk) {
+      Serial.println(F("      ...OK at quarter speed => SPI clock too fast."));
+      Serial.println(F("      Shorten the jumper wires (<10 cm) and retry."));
+    }
+  }
+
+  if (!cardOk) {
+    Serial.println(F("      The card never answered at all, so this is NOT a"));
+    Serial.println(F("      formatting or partition problem. Suspect, in order:"));
+    Serial.println(F("      1. module VCC — a 5 V module fed from 3V3 browns out"));
+    Serial.println(F("      2. CS pin mismatch (SD_CS_PIN is set to D10)"));
+    Serial.println(F("      3. MISO not returning to 3.3 V, or MOSI/MISO swapped"));
+    Serial.println(F("      4. dead card / bad contact"));
+    return;
+  }
+
+  Serial.print(F("[SD ] LAYER 1 ok — card type: "));
+  switch (card.type()) {
+    case SD_CARD_TYPE_SD1:  Serial.println(F("SD1"));       break;
+    case SD_CARD_TYPE_SD2:  Serial.println(F("SD2"));       break;
+    case SD_CARD_TYPE_SDHC: Serial.println(F("SDHC/SDXC")); break;
+    default:                Serial.println(F("unknown"));   break;
+  }
+
+  const uint32_t megabytes = card.cardSize() / 2048UL;   /* 512 B blocks -> MB */
+  Serial.print(F("      capacity ~"));
+  Serial.print(megabytes);
+  Serial.println(F(" MB"));
+  if (megabytes > 32768UL) {
+    Serial.println(F("      WARNING: >32 GB means SDXC. The SD library only"));
+    Serial.println(F("      supports SD/SDHC up to 32 GB — use a smaller card."));
+  }
+
+  if (!volume.init(card)) {
+    Serial.println(F("[SD ] LAYER 2 (FAT volume) FAILED"));
+    Serial.println(F("      The card responds, so the WIRING IS FINE. This is"));
+    Serial.println(F("      the partition table / filesystem. Probing each"));
+    Serial.println(F("      MBR partition slot:"));
+    for (uint8_t p = 1; p <= 4; p++) {
+      SdVolume v;
+      Serial.print(F("        partition "));
+      Serial.print(p);
+      Serial.print(F(": "));
+      if (v.init(card, p)) {
+        Serial.print(F("FAT"));
+        Serial.print(v.fatType());
+        Serial.println(p == 1 ? F("") : F("  <-- must be moved to slot 1"));
+      } else {
+        Serial.println(F("no FAT16/FAT32 volume"));
+      }
+    }
+    Serial.println(F("      The library reads MBR slot 1 only, and cannot read"));
+    Serial.println(F("      GPT or exFAT. Card must be a single MBR FAT16/FAT32"));
+    Serial.println(F("      partition."));
+    return;
+  }
+
+  Serial.print(F("[SD ] LAYER 2 ok — FAT"));
+  Serial.println(volume.fatType());
+  Serial.println(F("[SD ] LAYER 3 (root directory) is the remaining suspect —"));
+  Serial.println(F("      the filesystem is probably corrupt; reformat."));
+}
+
 static bool initSd() {
-  if (!SD.begin(SD_CS_PIN)) return false;
-  return true;
+  if (SD.begin(SD_CS_PIN)) return true;
+
+  /* Detail once, not on every 5 s retry. */
+  static bool detailPrinted = false;
+  if (!detailPrinted) {
+    detailPrinted = true;
+    reportSdFailure();
+  }
+  return false;
 }
 
 /* Opens the next free LOGnnnn.CSV and writes the header row. */
@@ -591,13 +678,16 @@ void setup() {
   }
   clipThresholdG = (float)ACCEL_RANGE_G * 0.98f;
 
+  /* Calibrate before touching the SD card: calibration blocks for ~2 s, and if
+   * the card is missing we want the red LED lit immediately afterwards rather
+   * than a dark board for two seconds. */
+  calibrateBaseline();
+
   if (initSd()) {
     Serial.println(F("[SD ] init ok"));
   } else {
-    enterError("SD init FAILED (check wiring, CS pin, card format FAT16/FAT32)");
+    enterError("SD init FAILED — see detail above");
   }
-
-  calibrateBaseline();
 
   nextSampleUs = micros();
   Serial.println(F("[   ] IDLE — waiting for vibration"));
