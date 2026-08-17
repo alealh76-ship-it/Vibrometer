@@ -158,6 +158,22 @@
 #define CAL_SAMPLES             200     /* 2 s @ 100 Hz */
 #define CAL_MAX_SPREAD_G        0.05f   /* only controls the warning now */
 
+/* Optional DS3231 real-time clock on the EXTERNAL I2C bus (A4/A5 = `Wire`).
+ * The onboard IMU lives on the internal bus (`Wire1`), so the two never meet.
+ * Set to 1 once the part is fitted; everything below compiles either way.
+ *
+ * Talked to by register, not through a library: the DS3231's register map is
+ * tiny and fixed, and that removes a Library Manager dependency along with any
+ * chance of an API mismatch. Register 0x0F bit 7 is the oscillator-stop flag,
+ * which is how we know whether the stored time is trustworthy at all. */
+#define USE_DS3231              0
+#define DS3231_ADDR             0x68
+
+/* How long the machine must be continuously quiet before a provisional
+ * baseline is snapped to the real resting norm. Mid-cycle pauses count — the
+ * machine is genuinely still then, so the reading is genuinely valid. */
+#define BASELINE_SNAP_QUIET_MS  5000UL
+
 /* Misc */
 #define SERIAL_BAUD             115200
 #define SERIAL_WAIT_MS          3000UL  /* don't block forever without USB */
@@ -186,7 +202,8 @@ static float    gravityBaseline = 1.0f;   /* g, seeded at boot then tracked */
 static float    acRms           = 0.0f;   /* rolling std of the norm, g */
 static uint32_t aboveSinceMs    = 0;      /* 0 = currently below threshold */
 static uint32_t lastActiveMs    = 0;      /* last time we were above threshold */
-static bool     baselineSeeded  = false;
+static bool     baselineProvisional = true;  /* seed not yet trusted */
+static uint32_t quietSinceMs    = 0;      /* 0 = not currently quiet */
 
 /* Sliding window for the AC metric. Deviations from the baseline are stored,
  * not raw norms: the raw norm is ~1.0 and its variance is ~1e-6, which a
@@ -222,6 +239,14 @@ static float    sessionPeakAc  = 0.0f;   /* g, peak of the AC metric */
 static float    sessionPeakDev = 0.0f;   /* g, peak |norm - baseline| */
 
 static uint32_t lastSdRetryMs  = 0;
+
+/* Serial command line (see handleCommand) */
+static char     cmdBuf[40];
+static uint8_t  cmdLen = 0;
+
+#if USE_DS3231
+static bool     rtcOk = false;            /* RTC present AND time trustworthy */
+#endif
 
 /* ==========================================================================
  * Onboard RGB LED (pins 22/23/24 on the Nano 33 BLE — active LOW)
@@ -396,7 +421,10 @@ static void calibrateBaseline() {
 #if AUTO_CALIBRATE_BASELINE
   Serial.print(F("[CAL] Measuring gravity baseline (keep the board still)... "));
 
-  float sum = 0.0f, lo = 1e9f, hi = -1e9f;
+  /* Accumulate centred on a first reading, for the same float32 reason the AC
+   * metric is centred: a sum of squares of numbers near 1.0 cannot resolve a
+   * variance near 1e-6. */
+  float ref = 0.0f, sum = 0.0f, sumSq = 0.0f, lo = 1e9f, hi = -1e9f;
   uint16_t got = 0;
   const uint32_t deadline = millis() + (CAL_SAMPLES * 1000UL / SAMPLE_RATE_HZ) + 2000UL;
 
@@ -405,37 +433,151 @@ static void calibrateBaseline() {
     float x, y, z;
     IMU.readAcceleration(x, y, z);
     const float n = sqrtf(x * x + y * y + z * z) * accelScale;
-    sum += n;
+    if (got == 0) ref = n;
+    const float d = n - ref;
+    sum   += d;
+    sumSq += d * d;
     if (n < lo) lo = n;
     if (n > hi) hi = n;
     got++;
   }
 
-  if (got >= CAL_SAMPLES / 2) {
-    gravityBaseline = sum / (float)got;
-    baselineSeeded  = true;
-    Serial.print(F("seeded at "));
-    Serial.print(gravityBaseline, 4);
-    Serial.print(F(" g from "));
-    Serial.print(got);
-    Serial.println(F(" samples"));
-    if ((hi - lo) >= CAL_MAX_SPREAD_G) {
-      Serial.print(F("      WARNING: board was moving (spread "));
-      Serial.print(hi - lo, 4);
-      Serial.println(F(" g). Seed used anyway — a measured value beats an"));
-      Serial.println(F("      assumed one, and the tracker will correct it within"));
-      Serial.println(F("      a few minutes of quiet. Do not hold the board at boot."));
-    }
+  if (got < CAL_SAMPLES / 2) {
+    gravityBaseline     = 1.0f;
+    baselineProvisional = true;
+    Serial.println(F("FAILED — no IMU samples. Using 1.0000 g provisionally."));
+    return;
+  }
+
+  const float mean = sum / (float)got;
+  float var = sumSq / (float)got - mean * mean;
+  if (var < 0.0f) var = 0.0f;
+  const float sd = sqrtf(var);
+
+  gravityBaseline = ref + mean;
+  Serial.print(F("seeded at "));
+  Serial.print(gravityBaseline, 4);
+  Serial.print(F(" g from "));
+  Serial.print(got);
+  Serial.print(F(" samples, AC "));
+  Serial.print(sd * 1000.0f, 2);
+  Serial.println(F(" mg"));
+
+  /* SEED GUARD. Judge the boot window with the same metric the trigger uses,
+   * not with peak-to-peak: if the machine is already running, or the board is
+   * being handled, this seed is measuring vibration and must not be trusted.
+   * It is still USED — a measured value beats an assumed one, and with the
+   * trigger now on the DC-free AC metric a wrong baseline no longer breaks
+   * detection at all, it only skews the logged `dev` column. It is simply
+   * marked provisional, and snapped at the first quiet stretch. */
+  if (sd >= VIBE_THRESHOLD) {
+    baselineProvisional = true;
+    Serial.println(F("      NOT TRUSTED: something was vibrating during the boot"));
+    Serial.println(F("      window — machine already running, or the board was"));
+    Serial.println(F("      being handled. Marked provisional; it will snap to the"));
+    Serial.print(F("      true resting value after "));
+    Serial.print(BASELINE_SNAP_QUIET_MS / 1000UL);
+    Serial.println(F(" s of quiet."));
   } else {
-    gravityBaseline = 1.0f;
-    Serial.println(F("FAILED — no IMU samples. Using 1.0000 g, expect a bad trigger."));
+    baselineProvisional = false;
+    if ((hi - lo) >= CAL_MAX_SPREAD_G) {
+      Serial.print(F("      note: peak-to-peak was "));
+      Serial.print(hi - lo, 4);
+      Serial.println(F(" g (a spike, but the window was quiet overall)"));
+    }
   }
 #else
-  gravityBaseline = 1.0f;
+  gravityBaseline     = 1.0f;
+  baselineProvisional = true;
 #endif
   /* Reset the stats the calibration reads polluted. */
   nStale = 0;
   nClipped = 0;
+}
+
+/* ==========================================================================
+ * DS3231 real-time clock (optional — see USE_DS3231)
+ *
+ * The whole point of the RTC on this rig is not pretty filenames, it is that
+ * the device runs unattended on a wall adapter. Without absolute time a power
+ * cut is invisible: millis() restarts near zero and "the machine was idle for
+ * 40 minutes" becomes indistinguishable from "the board was off for 40
+ * minutes". Those mean opposite things and the logs cannot tell them apart.
+ * ========================================================================== */
+
+struct RtcTime { uint16_t year; uint8_t mon, day, hour, min, sec; };
+
+#if USE_DS3231
+
+static uint8_t bcd2dec(uint8_t b) { return (uint8_t)((b >> 4) * 10 + (b & 0x0F)); }
+static uint8_t dec2bcd(uint8_t d) { return (uint8_t)(((d / 10) << 4) | (d % 10)); }
+
+static bool rtcReadReg(uint8_t reg, uint8_t *dst, uint8_t n) {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((uint8_t)DS3231_ADDR, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) dst[i] = (uint8_t)Wire.read();
+  return true;
+}
+
+static bool rtcRead(RtcTime *t) {
+  uint8_t r[7];
+  if (!rtcReadReg(0x00, r, 7)) return false;
+  t->sec  = bcd2dec(r[0] & 0x7F);
+  t->min  = bcd2dec(r[1] & 0x7F);
+  t->hour = bcd2dec(r[2] & 0x3F);        /* assumes 24 h mode, which we set */
+  t->day  = bcd2dec(r[4] & 0x3F);
+  t->mon  = bcd2dec(r[5] & 0x1F);
+  t->year = (uint16_t)(2000 + bcd2dec(r[6]));
+  return (t->mon >= 1 && t->mon <= 12 && t->day >= 1 && t->day <= 31);
+}
+
+/* Bit 7 of the status register latches whenever the oscillator has stopped —
+ * i.e. the backup cell died or was never fitted. If it is set the stored time
+ * is meaningless, however plausible it looks. */
+static bool rtcTimeTrustworthy() {
+  uint8_t s;
+  if (!rtcReadReg(0x0F, &s, 1)) return false;
+  return (s & 0x80) == 0;
+}
+
+static bool rtcSet(uint16_t Y, uint8_t M, uint8_t D, uint8_t h, uint8_t m, uint8_t s) {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write((uint8_t)0x00);
+  Wire.write(dec2bcd(s));
+  Wire.write(dec2bcd(m));
+  Wire.write(dec2bcd(h));                /* bit 6 clear = 24 hour mode */
+  Wire.write((uint8_t)1);                /* day-of-week, unused */
+  Wire.write(dec2bcd(D));
+  Wire.write(dec2bcd(M));
+  Wire.write(dec2bcd((uint8_t)(Y % 100)));
+  if (Wire.endTransmission() != 0) return false;
+
+  /* Clear the oscillator-stop flag now that the time is known good. */
+  uint8_t st;
+  if (rtcReadReg(0x0F, &st, 1)) {
+    Wire.beginTransmission(DS3231_ADDR);
+    Wire.write((uint8_t)0x0F);
+    Wire.write((uint8_t)(st & 0x7F));
+    Wire.endTransmission();
+  }
+  return true;
+}
+#endif  /* USE_DS3231 */
+
+/* Writes "2025-08-17 19:40:00" into dst (>=20 bytes), or "no-rtc" if there is
+ * no trustworthy time. Always safe to call. */
+static void rtcStamp(char *dst, size_t cap) {
+#if USE_DS3231
+  RtcTime t;
+  if (rtcOk && rtcRead(&t)) {
+    snprintf(dst, cap, "%04u-%02u-%02u %02u:%02u:%02u",
+             t.year, t.mon, t.day, t.hour, t.min, t.sec);
+    return;
+  }
+#endif
+  snprintf(dst, cap, "no-rtc");
 }
 
 /* ==========================================================================
@@ -594,8 +736,37 @@ static bool initSd() {
   return false;
 }
 
-/* Opens the next free LOGnnnn.CSV and writes the header row. */
+/* Opens a new log file and writes the header row.
+ *
+ * With a trustworthy RTC the name is MMDDHHMM.CSV — the 8.3 short-name limit
+ * the SD library enforces leaves exactly eight characters, so the year does
+ * not fit. It is recorded in BOOTLOG.CSV and in the serial log instead. A
+ * collision needs two cycles starting in the same minute, which QUIET_TIMEOUT
+ * makes impossible; if one somehow happens we fall back to the sequential
+ * name rather than overwrite anything. */
 static bool openLogFile() {
+#if USE_DS3231
+  if (rtcOk) {
+    RtcTime rt;
+    if (rtcRead(&rt)) {
+      snprintf(logName, sizeof(logName), "%02u%02u%02u%02u.CSV",
+               rt.mon, rt.day, rt.hour, rt.min);
+      if (!SD.exists(logName)) {
+        logFile = SD.open(logName, FILE_WRITE);
+        if (logFile) {
+          if (logFile.println(F("millis,ax,ay,az,dev,ac")) == 0) {
+            logFile.close();
+            enterError("Failed to write CSV header (card full?)");
+            return false;
+          }
+          logFile.flush();
+          return true;
+        }
+      }
+      Serial.println(F("[SD ] timestamped name taken — using sequential"));
+    }
+  }
+#endif
   uint16_t idx = highestLogIndex() + 1;
 
   /* highestLogIndex() only looks at well-formed names, so double-check the
@@ -717,6 +888,37 @@ static void endSession(const char *reason) {
   }
 }
 
+/* One line per boot. On a mains-powered rig this is the only record that an
+ * outage happened at all: compare each boot time against the last sample in
+ * the previous log file and the gap is the blind window. */
+static void appendBootLog() {
+  File f = SD.open("BOOTLOG.CSV", FILE_WRITE);
+  if (!f) {
+    Serial.println(F("[SD ] could not open BOOTLOG.CSV"));
+    return;
+  }
+  if (f.size() == 0) f.println(F("datetime,rtc_ok,baseline_g,seed_quiet"));
+
+  char stamp[24];
+  rtcStamp(stamp, sizeof(stamp));
+  f.print(stamp);
+  f.print(',');
+#if USE_DS3231
+  f.print(rtcOk ? '1' : '0');
+#else
+  f.print('0');
+#endif
+  f.print(',');
+  f.print(gravityBaseline, 4);
+  f.print(',');
+  f.println(baselineProvisional ? '0' : '1');
+  f.flush();
+  f.close();
+
+  Serial.print(F("[SD ] boot recorded in BOOTLOG.CSV at "));
+  Serial.println(stamp);
+}
+
 /* ==========================================================================
  * Sampling
  * ========================================================================== */
@@ -731,15 +933,46 @@ static void takeSample() {
    * cannot move `acRms` at all — which is the whole point of the change. */
   acRms = acPush(dev);
 
+  const uint32_t now = millis();
+
+  /* How long have we been continuously quiet? Drives both the seed guard and
+   * the slow tracker below. */
+  if (acCount == AC_WINDOW && acRms < VIBE_THRESHOLD) {
+    if (quietSinceMs == 0) quietSinceMs = now;
+  } else {
+    quietSinceMs = 0;
+  }
+
+  /* SEED GUARD. If the boot window was not quiet — power came back mid-cycle,
+   * or someone was holding the board — the seed is only provisional. Snap it
+   * to the true resting norm at the first properly quiet stretch instead of
+   * waiting minutes for the slow tracker to walk there.
+   *
+   * acSum is the running sum of (norm - gravityBaseline) over the window, so
+   * the correction is just its mean. No extra state, no second pass. */
+  if (baselineProvisional && quietSinceMs != 0 &&
+      (now - quietSinceMs) >= BASELINE_SNAP_QUIET_MS) {
+    const float corr = acSum / (float)acCount;
+    gravityBaseline += corr;
+    if (gravityBaseline < BASELINE_MIN_G) gravityBaseline = BASELINE_MIN_G;
+    if (gravityBaseline > BASELINE_MAX_G) gravityBaseline = BASELINE_MAX_G;
+    baselineProvisional = false;
+    Serial.print(F("[CAL] provisional baseline snapped to "));
+    Serial.print(gravityBaseline, 4);
+    Serial.print(F(" g after "));
+    Serial.print(BASELINE_SNAP_QUIET_MS / 1000UL);
+    Serial.print(F(" s quiet (moved "));
+    Serial.print(corr * 1000.0f, 1);
+    Serial.println(F(" mg)"));
+  }
+
   /* Track the baseline only while the machine is judged still, so a wash cycle
    * can never drag it. Clamped so a transient cannot poison it. */
-  if (acRms < VIBE_THRESHOLD && acCount == AC_WINDOW) {
+  if (quietSinceMs != 0) {
     gravityBaseline += dev * baselineAlpha;
     if (gravityBaseline < BASELINE_MIN_G) gravityBaseline = BASELINE_MIN_G;
     if (gravityBaseline > BASELINE_MAX_G) gravityBaseline = BASELINE_MAX_G;
   }
-
-  const uint32_t now = millis();
 
   /* Ignore the first window, before acRms means anything. */
   if (acCount == AC_WINDOW && acRms > VIBE_THRESHOLD) {
@@ -782,6 +1015,75 @@ static void takeSample() {
         enterError("SD write failed (card full or removed?)");
         return;
       }
+    }
+  }
+}
+
+/* ==========================================================================
+ * Serial commands
+ *
+ * The rig normally runs headless on a wall adapter, so these exist for the one
+ * bench session where a laptop is attached: set the clock, then walk away.
+ *   T2025-08-17 19:40:00   set the RTC
+ *   ?                      print current state
+ * ========================================================================== */
+
+static void printStatus() {
+  char stamp[24];
+  rtcStamp(stamp, sizeof(stamp));
+  Serial.println(F("---- status ----"));
+  Serial.print(F("  time      : ")); Serial.println(stamp);
+  Serial.print(F("  state     : "));
+  Serial.println(state == ST_IDLE ? F("IDLE") : state == ST_LOGGING ? F("LOGGING") : F("ERROR"));
+  Serial.print(F("  AC now    : ")); Serial.print(acRms * 1000.0f, 2);
+  Serial.print(F(" mg (threshold ")); Serial.print(VIBE_THRESHOLD * 1000.0f, 1);
+  Serial.println(F(" mg)"));
+  Serial.print(F("  baseline  : ")); Serial.print(gravityBaseline, 4);
+  Serial.println(baselineProvisional ? F(" g  PROVISIONAL") : F(" g  settled"));
+  Serial.print(F("  uptime    : ")); Serial.print(millis() / 1000UL); Serial.println(F(" s"));
+  if (state == ST_LOGGING) {
+    Serial.print(F("  file      : ")); Serial.println(logName);
+    Serial.print(F("  samples   : ")); Serial.println(nSamples);
+  }
+}
+
+static void handleCommand(const char *s) {
+  if (s[0] == '?') { printStatus(); return; }
+
+  if (s[0] == 'T' || s[0] == 't') {
+#if USE_DS3231
+    int Y, M, D, h, m, sec;
+    if (sscanf(s + 1, "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &sec) == 6 &&
+        Y >= 2000 && Y < 2100 && M >= 1 && M <= 12 && D >= 1 && D <= 31 &&
+        h < 24 && m < 60 && sec < 60) {
+      if (rtcSet((uint16_t)Y, (uint8_t)M, (uint8_t)D, (uint8_t)h, (uint8_t)m, (uint8_t)sec)) {
+        rtcOk = rtcTimeTrustworthy();
+        char stamp[24];
+        rtcStamp(stamp, sizeof(stamp));
+        Serial.print(F("[RTC] set to "));
+        Serial.println(stamp);
+      } else {
+        Serial.println(F("[RTC] write failed — check wiring on A4/A5"));
+      }
+    } else {
+      Serial.println(F("[RTC] usage: T2025-08-17 19:40:00"));
+    }
+#else
+    Serial.println(F("[RTC] not built in — set USE_DS3231 to 1 and reflash"));
+#endif
+    return;
+  }
+  Serial.println(F("[CMD] unknown. Commands: T<date time>, ?"));
+}
+
+/* Non-blocking: a handful of bytes per loop, never waits on the host. */
+static void pollSerial() {
+  while (Serial.available()) {
+    const char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdLen > 0) { cmdBuf[cmdLen] = '\0'; handleCommand(cmdBuf); cmdLen = 0; }
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
     }
   }
 }
@@ -836,6 +1138,32 @@ void setup() {
   }
   clipThresholdG = (float)ACCEL_RANGE_G * 0.98f;
 
+#if USE_DS3231
+  Wire.begin();                       /* external bus, A4/A5 — not the IMU's */
+  {
+    RtcTime rt;
+    if (!rtcRead(&rt)) {
+      rtcOk = false;
+      Serial.println(F("[RTC] DS3231 not responding on A4/A5 — falling back to"));
+      Serial.println(F("      LOGnnnn filenames. Check wiring and pull-ups."));
+    } else if (!rtcTimeTrustworthy()) {
+      rtcOk = false;
+      Serial.println(F("[RTC] oscillator-stop flag set: the stored time is NOT"));
+      Serial.println(F("      valid (dead or missing backup cell). Set it with"));
+      Serial.println(F("      T2025-08-17 19:40:00 — until then, LOGnnnn names."));
+    } else {
+      rtcOk = true;
+      char stamp[24];
+      rtcStamp(stamp, sizeof(stamp));
+      Serial.print(F("[RTC] ok, time is "));
+      Serial.println(stamp);
+    }
+  }
+#else
+  Serial.println(F("[RTC] not built in (USE_DS3231 = 0). Timestamps are"));
+  Serial.println(F("      relative to boot, and a power cut will be invisible."));
+#endif
+
   /* Calibrate before touching the SD card: calibration blocks for ~2 s, and if
    * the card is missing we want the red LED lit immediately afterwards rather
    * than a dark board for two seconds. */
@@ -843,6 +1171,7 @@ void setup() {
 
   if (initSd()) {
     Serial.println(F("[SD ] init ok"));
+    appendBootLog();
   } else {
     enterError("SD init FAILED — see detail above");
   }
@@ -903,5 +1232,6 @@ void loop() {
       break;
   }
 
+  pollSerial();
   ledUpdate();
 }

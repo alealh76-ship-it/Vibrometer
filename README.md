@@ -54,7 +54,54 @@ macros, so you never have to take this table on faith:
 > so `LED_BUILTIN` is unusable once the SD card is wired. That is why all status
 > indication uses the onboard RGB LED.
 
-Power is USB 5 V for now. Card must be FAT16/FAT32 formatted.
+Power is USB 5 V. Card must be FAT16/FAT32 formatted.
+
+### Optional: DS3231 real-time clock
+
+Off by default (`#define USE_DS3231 0`); the firmware builds and runs either way.
+
+| DS3231 | Nano 33 BLE Sense |
+|---|---|
+| SDA | A4 |
+| SCL | A5 |
+| VCC | 3V3 |
+| GND | GND |
+
+The onboard IMU sits on the **internal** I2C bus (`Wire1`), so an RTC on the
+A4/A5 header (`Wire`) shares nothing with it and adds no SPI pressure. Confirm
+against the boot banner before soldering.
+
+**Use a DS3231, not a DS1307.** The DS3231 is temperature-compensated (~1 min a
+year); the DS1307 drifts minutes per week, which defeats the point on a device
+nobody is watching.
+
+Talked to by register rather than through a library — the register map is tiny
+and fixed, so there is no Library Manager step and no API to mismatch. Register
+`0x0F` bit 7 is the oscillator-stop flag: if the backup cell is dead or missing,
+the stored time is garbage however plausible it looks, and the firmware says so
+and falls back to sequential filenames rather than writing a confident lie.
+
+**Why bother on a mains-powered rig.** Not for pretty filenames — because a
+power cut is otherwise *invisible*. `millis()` restarts near zero, and "the
+machine was idle for 40 minutes" becomes indistinguishable from "the board was
+off for 40 minutes". Those mean opposite things. With the RTC fitted, every boot
+is stamped in `BOOTLOG.CSV` and the blind window is the gap between that stamp
+and the last sample of the previous file. (For reference: across the first
+study the board ran 6.9 days without a single reset, so this is insurance rather
+than an active problem.)
+
+Set the clock once over USB, then walk away — it keeps time on its coin cell:
+
+```
+T2025-08-17 19:40:00
+```
+
+## Serial commands
+
+| Command | Effect |
+|---|---|
+| `T2025-08-17 19:40:00` | set the RTC |
+| `?` | print state: time, IDLE/LOGGING, live AC value, baseline and whether it is provisional, uptime |
 
 ## Build
 
@@ -80,9 +127,15 @@ is nothing to log without it.
 
 ## CSV output
 
-One file per cycle, `LOG0001.CSV`, `LOG0002.CSV`, … The card root is scanned at
-session start and numbering continues from the highest existing file, so prior
-sessions are never overwritten.
+One file per cycle. With a trustworthy RTC the name is `MMDDHHMM.CSV`
+(`08171940.CSV`); the SD library's 8.3 short-name limit leaves exactly eight
+characters, so the year does not fit and is recorded in `BOOTLOG.CSV` instead.
+Without an RTC it falls back to `LOG0001.CSV`, `LOG0002.CSV`, … — the card root
+is scanned at session start and numbering continues from the highest existing
+file, so prior sessions are never overwritten either way.
+
+`BOOTLOG.CSV` gets one line per boot: `datetime,rtc_ok,baseline_g,seed_quiet`.
+On an unattended rig this is the only record that an outage happened at all.
 
 ```
 millis,ax,ay,az,dev,ac
@@ -93,10 +146,11 @@ millis,ax,ay,az,dev,ac
 > the header `millis,ax,ay,az,magnitude` with an unsigned, `abs()`-folded last
 > column. Check the header row before parsing.
 
-- `millis` — `millis()` at sample time, relative to **boot**, not to file start.
-  Absolute wall-clock time is not recorded (no RTC); relative time within a
-  session is what the analysis needs. Note this means timestamps do **not**
-  reset between files, which is convenient for stitching sessions together.
+- `millis` — `millis()` at sample time, relative to **boot**, not to file start,
+  and monotonic across every file in a boot, which is what makes sessions
+  stitchable. It stays the sample clock even with the RTC fitted: higher
+  resolution, and no I2C read per sample. Absolute time comes from the filename
+  and `BOOTLOG.CSV`.
 - `ax/ay/az` — g, 4 decimals (`±4 g` range is ~0.000122 g/LSB, so 4 decimals is
   matched to the sensor).
 - `dev` — `sqrt(ax²+ay²+az²) − gravityBaseline`, in g. **Signed.** The old
@@ -110,9 +164,29 @@ millis,ax,ay,az,dev,ac
 
 `gravityBaseline` is seeded at boot and then tracked continuously, but only while
 `ac` says the machine is still, so a wash can never drag it. It is clamped to
-0.85–1.15 g. A noisy boot measurement now warns and is still used — a measured
-value beats an assumed one, and the tracker corrects it within a few minutes of
-quiet.
+0.85–1.15 g.
+
+**Seed guard.** The boot window is judged with the same AC metric the trigger
+uses, not with peak-to-peak. If something was vibrating during it — the machine
+already running after a power cut, or someone holding the board — the seed is
+marked **provisional** and snapped to the true resting norm at the first
+`BASELINE_SNAP_QUIET_MS` of continuous quiet, rather than waiting minutes for
+the slow tracker to walk there. Mid-cycle pauses count as quiet, because the
+machine genuinely is still then.
+
+The provisional seed is still *used*: a measured value beats an assumed one, and
+now that the trigger runs on the DC-free `ac` metric a wrong baseline cannot
+break detection at all — it only skews the logged `dev` column, which is
+recoverable offline anyway. Replayed against the logged data:
+
+| boot condition | seed | guard | outcome |
+|---|---|---|---|
+| machine off | 0.9847 g, AC 2.3 mg | trusted | settles at 0.9845 g |
+| power back mid-spin (LOG0008) | 1.0382 g — 55 mg out | fires | snaps to 0.9822 g at t+103 s |
+| power back mid-spin (LOG0005) | 1.0590 g — 77 mg out | fires | snaps to 0.9830 g at t+192 s |
+
+Those unguarded seeds are 3–5× worse than the 15–19 mg error that made the first
+study's trigger useless.
 
 ## Tuning knobs
 
@@ -130,6 +204,8 @@ All at the top of the `.ino`:
 | `ACCEL_RANGE_G` | `4` | full scale; confirmed correct by the first study |
 | `FLUSH_EVERY_SAMPLES` / `FLUSH_INTERVAL_MS` | `200` / `10000` | buffer push / FAT flush cadence |
 | `AUTO_CALIBRATE_BASELINE` | `1` | set `0` to skip the boot seed |
+| `BASELINE_SNAP_QUIET_MS` | `5000` | continuous quiet needed before a provisional seed is snapped |
+| `USE_DS3231` | `0` | set `1` when the RTC is fitted |
 
 **Every default above that is not a round number was measured**, not guessed —
 see "What the first 12-log study changed" below.
