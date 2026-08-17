@@ -85,9 +85,13 @@ session start and numbering continues from the highest existing file, so prior
 sessions are never overwritten.
 
 ```
-millis,ax,ay,az,magnitude
-12340,-0.0123,0.9876,-0.0456,0.0234
+millis,ax,ay,az,dev,ac
+12340,-0.0123,0.9876,-0.0456,-0.0021,0.00412
 ```
+
+> **Format changed after the first study.** Files from the earlier firmware have
+> the header `millis,ax,ay,az,magnitude` with an unsigned, `abs()`-folded last
+> column. Check the header row before parsing.
 
 - `millis` — `millis()` at sample time, relative to **boot**, not to file start.
   Absolute wall-clock time is not recorded (no RTC); relative time within a
@@ -95,15 +99,20 @@ millis,ax,ay,az,magnitude
   reset between files, which is convenient for stitching sessions together.
 - `ax/ay/az` — g, 4 decimals (`±4 g` range is ~0.000122 g/LSB, so 4 decimals is
   matched to the sensor).
-- `magnitude` — `|sqrt(ax²+ay²+az²) − gravityBaseline|`, in g. This is the raw
-  (unsmoothed) trigger metric; the trigger itself runs on a smoothed version of
-  it. Fully recomputable offline from the three axes.
+- `dev` — `sqrt(ax²+ay²+az²) − gravityBaseline`, in g. **Signed.** The old
+  column took the absolute value, which folded the signal about the baseline and
+  destroyed information whenever the baseline was wrong. Signed also means the
+  tracked baseline is recoverable offline as `norm − dev`, so you never need the
+  serial log to interpret a file.
+- `ac` — rolling standard deviation of the norm over `AC_WINDOW_MS`, in g,
+  5 decimals. **This is what the trigger runs on.** It has no DC term, so a
+  baseline error cannot move it.
 
-`gravityBaseline` is measured at boot over 2 s instead of assuming exactly
-1.000 g, so the metric sits at ~0 whatever orientation the board is mounted in.
-If the board is moving during that window the calibration is rejected (spread >
-0.05 g) and it falls back to 1.0000 g. The value used is printed on boot —
-**write it down**, it is not stored in the CSV.
+`gravityBaseline` is seeded at boot and then tracked continuously, but only while
+`ac` says the machine is still, so a wash can never drag it. It is clamped to
+0.85–1.15 g. A noisy boot measurement now warns and is still used — a measured
+value beats an assumed one, and the tracker corrects it within a few minutes of
+quiet.
 
 ## Tuning knobs
 
@@ -113,22 +122,21 @@ All at the top of the `.ino`:
 |---|---|---|
 | `SD_CS_PIN` | `10` | SD chip select |
 | `SAMPLE_RATE_HZ` | `100` | log rate |
-| `VIBE_THRESHOLD` | `0.02f` | g, on the **smoothed** magnitude — start/continue logging above this |
+| `VIBE_THRESHOLD` | `0.006f` | g, on the **`ac` metric** — start/continue logging above this |
+| `AC_WINDOW_MS` | `1000` | averaging window for the `ac` metric |
 | `TRIGGER_CONFIRM_MS` | `500` | must stay above threshold this long to open a file (rejects door bumps) |
-| `QUIET_TIMEOUT_MS` | `300000` (5 min) | quiet time before closing the file |
-| `VIBE_SMOOTH_SAMPLES` | `25` | EMA length for the trigger signal (~0.25 s @ 100 Hz) |
-| `ACCEL_RANGE_G` | `4` | full scale; see below |
-| `FLUSH_EVERY_SAMPLES` / `FLUSH_INTERVAL_MS` | `100` / `1000` | buffer push / FAT flush cadence |
-| `AUTO_CALIBRATE_BASELINE` | `1` | set `0` to force a 1.0 g baseline |
+| `QUIET_TIMEOUT_MS` | `1500000` (25 min) | quiet time before closing the file |
+| `BASELINE_TAU_S` | `300` | baseline tracker time constant (only runs while still) |
+| `ACCEL_RANGE_G` | `4` | full scale; confirmed correct by the first study |
+| `FLUSH_EVERY_SAMPLES` / `FLUSH_INTERVAL_MS` | `200` / `10000` | buffer push / FAT flush cadence |
+| `AUTO_CALIBRATE_BASELINE` | `1` | set `0` to skip the boot seed |
+
+**Every default above that is not a round number was measured**, not guessed —
+see "What the first 12-log study changed" below.
 
 **First run:** set `QUIET_TIMEOUT_MS` to something short (say 20 s) and confirm
-start/stop works by hand-shaking the machine, then put it back to 5 minutes
+start/stop works by hand-shaking the machine, then put it back to 25 minutes
 before running a real cycle.
-
-`VIBE_THRESHOLD` at 0.02 g is a guess for a machine on a solid floor. The
-honest way to set it: run one cycle with the threshold low (0.005 g) so it
-triggers on almost anything, then look at the recorded `magnitude` during a
-genuine pause versus the idle floor and pick a value between them.
 
 ## Serial output
 
@@ -136,9 +144,10 @@ Boot diagnostics (IMU/SD init, calibrated baseline, config echo), then a line pe
 transition, and a stats block on every file close:
 
 ```
-[>>>] 41233 ms: IDLE -> LOGGING, file LOG0007.CSV, trigger level 0.0241 g
+[>>>] 41233 ms: IDLE -> LOGGING, file LOG0007.CSV, AC level 8.14 mg
 [<<<] 3182044 ms: LOGGING -> IDLE (quiet timeout)
-      file=LOG0007.CSV duration=3140s samples=313902 peak=0.4412 g
+      file=LOG0007.CSV duration=3140s samples=313902 peakAC=203.3 mg
+      peakDev=0.4412 g baseline=0.9831 g
       dropped=98 stale=0 clipped=0 effective_rate=99.9 Hz
 ```
 
@@ -164,26 +173,31 @@ breakout is wired elsewhere. Two things worth double-checking on the *module*
 side: its pin labels (often silkscreened underneath) and the **3.3 V
 level-shifting on MISO** — see the warnings above.
 
-**2. Is 100 Hz achievable?** Yes, with one caveat that is about the IMU, not the
-SD card.
+**2. Is 100 Hz achievable?** No — it ran at **88.2 Hz**, and the first study
+settled both halves of this question with real numbers.
 
-- *SD side — fine.* 100 samples/s × ~40 bytes = ~4 kB/s, pushed as one
-  ~4 kB block write per second. Even a slow card manages that in well under
-  50 ms, against a 1000 ms budget — roughly 5% duty. Sampling is scheduled off
-  `micros()` and resyncs after an overrun, so a slow write costs a few dropped
-  samples (counted and reported), never a drift in timestamps. Formatting is
-  done with integer math as each sample is taken, deliberately avoiding
-  `printf("%f")`, which is slow enough at 100 Hz to matter.
-- *IMU side — the real limit.* The stock `Arduino_LSM9DS1` library hard-codes
-  the accelerometer ODR to **119 Hz** and offers no API to change it. Sampling
-  at 100 Hz against a free-running 119 Hz source means occasional ticks find no
-  new data; the sketch reuses the previous reading and counts it in **stale**.
-  Expect a small non-zero stale count — that is aliasing between the two clocks,
-  not a fault. If stale is high or you want exact alignment, the clean fallback
-  is `SAMPLE_RATE_HZ 50` (an even sub-multiple region of 119 Hz where every tick
-  reliably has fresh data), which is still ~25× the frequency content that
-  matters for cycle-state detection. **Recommendation:** keep 100 Hz for the
-  first few cycles, check the stale count, drop to 50 Hz if it bothers you.
+- *SD side — this is where the loss is.* **13.5%** of wall-clock time sat inside
+  gaps longer than 15 ms: 22,554 gaps over 50 ms, 45 over 200 ms, worst case
+  1,473 ms. My original estimate of ~5% duty was optimistic by roughly 3×. The
+  expensive operation is `flush()`, which forces a FAT + directory update, so
+  it now runs every 10 s instead of every 1 s while block writes stay frequent.
+  Whether that recovers the missing 12 Hz is measurable: watch `effective_rate`
+  in the end-of-session line.
+- *IMU side.* The stock library fixes the accelerometer ODR at 119 Hz, so a
+  100 Hz tick occasionally finds no new data and reuses the previous reading.
+  That is the `stale` counter, and it was **0** across all twelve logs — a
+  non-issue in practice.
+
+> **Correction.** An earlier version of this file, and the first analysis
+> report, suggested dropping to `SAMPLE_RATE_HZ 50` as a fallback and claimed
+> "all the energy is below 20 Hz." **That was wrong, and I had not measured it.**
+> An FFT of the spin segments shows the fundamental at **13.4 Hz** with a strong
+> second harmonic at **26.8 Hz**, and only 50% of the AC energy below 13–17 Hz.
+> **37% of the energy sits above 25 Hz.** Sampling at 50 Hz puts Nyquist at
+> 25 Hz and folds that 37% back into the band as false low-frequency content —
+> it would corrupt exactly the signal the detector depends on. Keep 100 Hz;
+> Nyquist then lands at 50 Hz, which is also where the LSM9DS1's own
+> anti-aliasing filter rolls off, so the two match.
 
 **3. Full-scale range.** The stock library is hard-wired to **±4 g** with no
 public API to change it, so the sketch does two things: it counts **clipped**
@@ -278,6 +292,35 @@ one you have before re-checking the jumpers.
 The diagnostic also retries at a slower SPI clock. If it only works slow, that's
 signal integrity: shorten the jumpers to under ~10 cm. Don't ignore it — it can
 init at boot and then corrupt data later at full logging rate.
+
+## What the first 12-log study changed
+
+12 files, 2,064,401 samples, 6.5 h of recording over one 6.9-day uptime. Full
+interactive review of every trace: **[Washer Vibration Trace Review](https://claude.ai/code/artifact/56c5b056-3528-4821-ad31-946e26387eaa)**.
+
+| Finding | Evidence | Change |
+|---|---|---|
+| Baseline never calibrated | fitted device baseline was exactly `1.0000 g`; board rests at `0.9845 g` | seed is now always used; noisy seed warns instead of falling back to 1.0 |
+| Baseline drifts | `15.4 mg → 18.7 mg` error over 3.3 days | continuous tracker, `BASELINE_TAU_S`, updates only while still |
+| Threshold sat inside the error | 20 mg threshold vs 15–19 mg pedestal; 5 of 12 files contained no cycle | trigger moved to the DC-free `ac` metric at 6 mg |
+| Metric barely separated on/off | 1.2× against ground truth; AC metric gives 2.0× | `ac` = rolling σ of the norm |
+| 5 min timeout split a cycle | LOG0008–11 separated by 6.3/8.1/8.1 min pauses; worst internal pause 19.5 min | `QUIET_TIMEOUT_MS` → 25 min |
+| Scheduler double-sampled | 27,122 samples (1.31%) arrived 0–1 ms after their predecessor | resync advances `missed + 1` intervals |
+| SD stalls cost 12 Hz | 13.5% of time in gaps > 15 ms | FAT flush every 10 s instead of 1 s |
+| ±4 g correct | peak excursion 1.93 g, zero clipped samples | unchanged, now confirmed |
+
+**Why the `ac` metric is centred before accumulating.** It is a rolling variance,
+and the raw norm is ≈1.0 with a variance ≈1e-6 — float32 cannot resolve that
+difference (catastrophic cancellation). Storing `norm − baseline` instead puts
+the values near zero where float32 has resolution to spare. Verified by replaying
+the firmware's exact `acPush()` over all 2.06 M logged samples against a float64
+reference: the centred version's worst error is **0.0004 mg**; the naive version
+errs by up to **3.6 mg**, which is comparable to the 6 mg threshold and would
+have broken the detector outright.
+
+**Still unknown:** whether LOG0008–11 really was one wash. The logger has no
+clock, so that is inferred from gap structure, not measured. Noting the start
+time of a couple of washes by hand would settle it.
 
 ## Known limitations
 

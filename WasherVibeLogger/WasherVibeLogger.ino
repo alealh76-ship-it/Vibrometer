@@ -20,12 +20,21 @@
  *              Retries SD init every SD_RETRY_INTERVAL_MS.
  *
  * CSV format (one file per cycle, LOG0001.CSV, LOG0002.CSV, ...)
- *   millis,ax,ay,az,magnitude
- *   - millis    : millis() at sample time, relative to boot (no RTC)
- *   - ax/ay/az  : g, 4 decimals (LSM9DS1 @ +/-4 g is ~0.000122 g/LSB)
- *   - magnitude : |sqrt(ax^2+ay^2+az^2) - gravityBaseline|, in g
- *                 This is the same signal the trigger uses (before smoothing),
- *                 and it is fully recomputable offline from ax/ay/az.
+ *   millis,ax,ay,az,dev,ac
+ *   - millis   : millis() at sample time, relative to boot (no RTC)
+ *   - ax/ay/az : g, 4 decimals (LSM9DS1 @ +/-4 g is ~0.000122 g/LSB)
+ *   - dev      : sqrt(ax^2+ay^2+az^2) - gravityBaseline, in g. SIGNED, unlike
+ *                the old `magnitude` column: taking the absolute value folded
+ *                the signal about the baseline and destroyed information when
+ *                the baseline was wrong. Signed also makes the tracked
+ *                baseline recoverable offline as (norm - dev).
+ *   - ac       : rolling standard deviation of the norm over AC_WINDOW_MS, in
+ *                g, 5 decimals. THIS is what the trigger runs on. It carries
+ *                no DC term, so a baseline error cannot move it.
+ *
+ * Format changed after the first 12-log study. Files written by the earlier
+ * firmware have the header `millis,ax,ay,az,magnitude` and an unsigned,
+ * abs()-folded last column; check the header row before parsing.
  *
  * Wiring (SPI pins are fixed on the Nano 33 BLE; only CS is your choice)
  *   SD MOSI -> D11    SD MISO -> D12    SD SCK -> D13    SD CS -> D10
@@ -79,23 +88,44 @@
  * no new data and the previous reading was reused. */
 #define SAMPLE_RATE_HZ          100
 
-/* Vibration threshold, in g, applied to the SMOOTHED magnitude.
- * Start high-ish and lower it after looking at a real idle-vs-wash recording.
- * 0.02 g is a reasonable first guess for a machine on a solid floor. */
-#define VIBE_THRESHOLD          0.02f
+/* Activity threshold, in g, applied to the AC metric (`ac` column).
+ * Measured from the first 12-log study: with the machine confirmed off the AC
+ * metric sits at 0.4-1.3 mg and its 99th percentile is 4.5 mg; a running
+ * machine is 6-200 mg. A sweep over that data puts the knee at 5-6 mg, where
+ * false triggers are 0.33% of idle seconds and 52% of cycle time is captured.
+ * Below 4 mg false triggers climb sharply; above 12 mg gentle agitation starts
+ * being discarded. */
+#define VIBE_THRESHOLD          0.006f
 
-/* How long the smoothed magnitude must stay above threshold before we open a
- * file. Rejects door bumps, someone leaning on the machine, etc. */
+/* Averaging window for the AC metric. 1 s is long enough to average out the
+ * sensor noise floor and short enough to catch the start of agitation. */
+#define AC_WINDOW_MS            1000
+
+/* How long the AC metric must stay above threshold before we open a file.
+ * Rejects door bumps, someone leaning on the machine, etc. */
 #define TRIGGER_CONFIRM_MS      500UL
 
 /* How long the machine must stay quiet before we close the file and go IDLE.
- * Washers pause for minutes mid-cycle (soak, drain, redistribute), and this
- * study is specifically about characterising those pauses — err long. */
-#define QUIET_TIMEOUT_MS        (5UL * 60UL * 1000UL)   /* 5 minutes */
+ * The first study ran this at 5 minutes and it CUT ONE WASH INTO FOUR FILES
+ * (LOG0008-11, separated by real pauses of 6.3, 8.1 and 8.1 minutes). Measured
+ * over 537 mid-cycle pauses: median 2 s, 90% inside 37 s, but 11 outlast
+ * 5 minutes, 2 outlast 15, and the longest is 19.5. The distribution only
+ * reaches zero at 20 minutes, so 25 is the smallest defensible setting and
+ * leaves margin for a wash that study never captured. Disk cost of the extra
+ * idle tail is ~6 MB per cycle. */
+#define QUIET_TIMEOUT_MS        (25UL * 60UL * 1000UL)  /* 25 minutes */
 
-/* Smoothing time constant for the trigger signal, in samples. Larger = calmer
- * trigger, slower response. ~25 samples @100 Hz is a 0.25 s time constant. */
-#define VIBE_SMOOTH_SAMPLES     25.0f
+/* Time constant of the gravity-baseline tracker, in seconds. The baseline only
+ * moves while the AC metric says the machine is still, so this never chases a
+ * wash cycle. It exists because the resting norm DRIFTS: over the 3.3 days of
+ * the first study it moved 15.4 -> 18.7 mg away from 1 g, most likely with
+ * temperature. A one-shot calibration at boot cannot track that. */
+#define BASELINE_TAU_S          300.0f
+
+/* Hard limits on the tracked baseline, so one wild transient cannot poison it.
+ * The board's true resting norm was 0.9813-0.9846 g across the whole study. */
+#define BASELINE_MIN_G          0.85f
+#define BASELINE_MAX_G          1.15f
 
 /* Accelerometer full-scale range, in g. The stock library is hard-wired to
  * +/-4 g; any other value here is applied by writing CTRL_REG6_XL directly and
@@ -104,17 +134,29 @@
 #define ACCEL_RANGE_G           4
 
 /* Log buffer. Samples are formatted into this buffer as they are taken and
- * pushed to the SD card in one block, instead of writing per sample. */
-#define LOG_BUFFER_BYTES        4096
-#define FLUSH_EVERY_SAMPLES     100     /* push buffer to file every N samples */
-#define FLUSH_INTERVAL_MS       1000UL  /* ...and force a FAT flush this often */
+ * pushed to the SD card in one block, instead of writing per sample.
+ *
+ * The first study logged at an effective 88.2 Hz against a 100 Hz target:
+ * 13.5% of wall-clock time sat inside gaps over 15 ms, caused by SD writes.
+ * The expensive part is flush(), which forces a FAT + directory update, so the
+ * FAT flush is now every 10 s instead of every 1 s while the block writes stay
+ * frequent. Cost of a power cut is up to 10 s of samples instead of 1 s, which
+ * is an easy trade on a USB-powered bench rig. Watch effective_rate in the
+ * end-of-session line to see whether this actually bought anything. */
+#define LOG_BUFFER_BYTES        8192
+#define FLUSH_EVERY_SAMPLES     200     /* push buffer to file every N samples */
+#define FLUSH_INTERVAL_MS       10000UL /* ...and force a FAT flush this often */
 
-/* Boot-time gravity baseline calibration. The board's resting orientation sets
- * the DC level of the vector norm; measuring it beats assuming exactly 1.000 g.
- * Rejected (falls back to 1.0 g) if the board is moving during calibration. */
+/* Boot-time seed for the gravity baseline. This only has to be roughly right —
+ * the continuous tracker above corrects it — but it must never be a hard-coded
+ * 1.0 g. In the first study the spread check rejected the measurement (almost
+ * certainly because the board was being handled at power-on, which is exactly
+ * when someone is touching it) and the fallback left a 15-19 mg error sitting
+ * underneath a 20 mg trigger threshold. A noisy measurement now WARNS and is
+ * still used, because a measured value is always closer than an assumed one. */
 #define AUTO_CALIBRATE_BASELINE 1
 #define CAL_SAMPLES             200     /* 2 s @ 100 Hz */
-#define CAL_MAX_SPREAD_G        0.05f   /* reject calibration if noisier */
+#define CAL_MAX_SPREAD_G        0.05f   /* only controls the warning now */
 
 /* Misc */
 #define SERIAL_BAUD             115200
@@ -140,10 +182,24 @@ static uint32_t nextSampleUs   = 0;
 static float    lastAx = 0.0f, lastAy = 0.0f, lastAz = 1.0f;
 
 /* Detection signals */
-static float    gravityBaseline = 1.0f;   /* g, set by calibration */
-static float    vibeLevel       = 0.0f;   /* smoothed |norm - baseline|, g */
+static float    gravityBaseline = 1.0f;   /* g, seeded at boot then tracked */
+static float    acRms           = 0.0f;   /* rolling std of the norm, g */
 static uint32_t aboveSinceMs    = 0;      /* 0 = currently below threshold */
 static uint32_t lastActiveMs    = 0;      /* last time we were above threshold */
+static bool     baselineSeeded  = false;
+
+/* Sliding window for the AC metric. Deviations from the baseline are stored,
+ * not raw norms: the raw norm is ~1.0 and its variance is ~1e-6, which a
+ * sum-of-squares in float32 cannot resolve (catastrophic cancellation).
+ * Centring first puts the stored values near zero, where float32 has plenty
+ * of resolution to spare. */
+#define AC_WINDOW  ((uint16_t)((uint32_t)SAMPLE_RATE_HZ * AC_WINDOW_MS / 1000UL))
+static float    acBuf[AC_WINDOW];
+static uint16_t acHead  = 0;
+static uint16_t acCount = 0;
+static float    acSum   = 0.0f;
+static float    acSumSq = 0.0f;
+static const float baselineAlpha = 1.0f / (BASELINE_TAU_S * (float)SAMPLE_RATE_HZ);
 
 /* Accel scale correction, applied when ACCEL_RANGE_G != 4 (library assumes 4) */
 static float    accelScale      = 1.0f;
@@ -152,7 +208,7 @@ static float    clipThresholdG  = (float)ACCEL_RANGE_G * 0.98f;
 /* Write buffer */
 static char     logBuf[LOG_BUFFER_BYTES];
 static size_t   logBufLen      = 0;
-#define LINE_MAX 72     /* worst-case formatted line length, incl. newline */
+#define LINE_MAX 80     /* worst-case formatted line length, incl. newline */
 
 /* Per-session statistics, printed on close */
 static uint32_t sessionStartMs = 0;
@@ -162,7 +218,8 @@ static uint32_t lastFlushMs    = 0;
 static uint32_t nStale         = 0;   /* IMU had no new data at tick time */
 static uint32_t nDropped       = 0;   /* ticks skipped (SD write overran) */
 static uint32_t nClipped       = 0;   /* samples at/over full scale */
-static float    sessionPeakG   = 0.0f;
+static float    sessionPeakAc  = 0.0f;   /* g, peak of the AC metric */
+static float    sessionPeakDev = 0.0f;   /* g, peak |norm - baseline| */
 
 static uint32_t lastSdRetryMs  = 0;
 
@@ -301,8 +358,40 @@ static float readAccel(float *ax, float *ay, float *az) {
   return sqrtf(lastAx * lastAx + lastAy * lastAy + lastAz * lastAz);
 }
 
-/* Measures the resting vector norm so the trigger metric sits at ~0 when the
- * machine is still, whatever orientation the board is mounted in. */
+/* Pushes one deviation into the sliding window and returns the window's
+ * standard deviation — the AC metric the trigger runs on. O(1) per sample. */
+static float acPush(float dev) {
+  if (acCount == AC_WINDOW) {
+    const float old = acBuf[acHead];
+    acSum   -= old;
+    acSumSq -= old * old;
+  } else {
+    acCount++;
+  }
+  acBuf[acHead] = dev;
+  acSum   += dev;
+  acSumSq += dev * dev;
+  acHead   = (uint16_t)((acHead + 1) % AC_WINDOW);
+
+  /* The incremental add/subtract above drifts as float rounding error piles up
+   * over hours. Once per lap of the ring, recompute exactly — that is one pass
+   * over AC_WINDOW floats per second, which is nothing. */
+  if (acHead == 0) {
+    float s = 0.0f, s2 = 0.0f;
+    for (uint16_t i = 0; i < acCount; i++) { s += acBuf[i]; s2 += acBuf[i] * acBuf[i]; }
+    acSum = s; acSumSq = s2;
+  }
+
+  const float inv  = 1.0f / (float)acCount;
+  const float mean = acSum * inv;
+  float var = acSumSq * inv - mean * mean;
+  if (var < 0.0f) var = 0.0f;          /* rounding can push it just below zero */
+  return sqrtf(var);
+}
+
+/* Seeds the resting vector norm so `dev` sits at ~0 when the machine is still,
+ * whatever orientation the board is mounted in. Only a seed — trackBaseline()
+ * below owns the value from then on. */
 static void calibrateBaseline() {
 #if AUTO_CALIBRATE_BASELINE
   Serial.print(F("[CAL] Measuring gravity baseline (keep the board still)... "));
@@ -322,16 +411,24 @@ static void calibrateBaseline() {
     got++;
   }
 
-  if (got >= CAL_SAMPLES / 2 && (hi - lo) < CAL_MAX_SPREAD_G) {
+  if (got >= CAL_SAMPLES / 2) {
     gravityBaseline = sum / (float)got;
-    Serial.print(F("ok, baseline = "));
+    baselineSeeded  = true;
+    Serial.print(F("seeded at "));
     Serial.print(gravityBaseline, 4);
-    Serial.println(F(" g"));
+    Serial.print(F(" g from "));
+    Serial.print(got);
+    Serial.println(F(" samples"));
+    if ((hi - lo) >= CAL_MAX_SPREAD_G) {
+      Serial.print(F("      WARNING: board was moving (spread "));
+      Serial.print(hi - lo, 4);
+      Serial.println(F(" g). Seed used anyway — a measured value beats an"));
+      Serial.println(F("      assumed one, and the tracker will correct it within"));
+      Serial.println(F("      a few minutes of quiet. Do not hold the board at boot."));
+    }
   } else {
     gravityBaseline = 1.0f;
-    Serial.print(F("too noisy (spread "));
-    Serial.print(hi - lo, 4);
-    Serial.println(F(" g) — falling back to 1.0000 g"));
+    Serial.println(F("FAILED — no IMU samples. Using 1.0000 g, expect a bad trigger."));
   }
 #else
   gravityBaseline = 1.0f;
@@ -519,7 +616,7 @@ static bool openLogFile() {
     return false;
   }
 
-  if (logFile.println(F("millis,ax,ay,az,magnitude")) == 0) {
+  if (logFile.println(F("millis,ax,ay,az,dev,ac")) == 0) {
     logFile.close();
     enterError("Failed to write CSV header (card full or write-protected?)");
     return false;
@@ -556,7 +653,8 @@ static void startSession() {
   nStale         = 0;
   nDropped       = 0;
   nClipped       = 0;
-  sessionPeakG   = 0.0f;
+  sessionPeakAc  = 0.0f;
+  sessionPeakDev = 0.0f;
   sessionStartMs = millis();
   lastFlushMs    = sessionStartMs;
   lastActiveMs   = sessionStartMs;
@@ -566,9 +664,9 @@ static void startSession() {
   Serial.print(sessionStartMs);
   Serial.print(F(" ms: IDLE -> LOGGING, file "));
   Serial.print(logName);
-  Serial.print(F(", trigger level "));
-  Serial.print(vibeLevel, 4);
-  Serial.println(F(" g"));
+  Serial.print(F(", AC level "));
+  Serial.print(acRms * 1000.0f, 2);
+  Serial.println(F(" mg"));
 }
 
 static void endSession(const char *reason) {
@@ -587,7 +685,11 @@ static void endSession(const char *reason) {
   Serial.print(F("      file="));      Serial.print(logName);
   Serial.print(F(" duration="));       Serial.print(dur / 1000UL);
   Serial.print(F("s samples="));       Serial.print(nSamples);
-  Serial.print(F(" peak="));           Serial.print(sessionPeakG, 4);
+  Serial.print(F(" peakAC="));         Serial.print(sessionPeakAc * 1000.0f, 1);
+  Serial.print(F(" mg"));
+  Serial.println();
+  Serial.print(F("      peakDev="));   Serial.print(sessionPeakDev, 4);
+  Serial.print(F(" g baseline="));     Serial.print(gravityBaseline, 4);
   Serial.println(F(" g"));
 
   Serial.print(F("      dropped="));   Serial.print(nDropped);
@@ -622,15 +724,25 @@ static void endSession(const char *reason) {
 static void takeSample() {
   float ax, ay, az;
   const float norm = readAccel(&ax, &ay, &az);
-  const float mag  = fabsf(norm - gravityBaseline);
+  const float dev  = norm - gravityBaseline;      /* signed, see header */
 
-  /* Exponential moving average — the trigger runs on this, not on `mag`, so a
-   * single noisy sample can't start or extend a session. */
-  vibeLevel += (mag - vibeLevel) / VIBE_SMOOTH_SAMPLES;
+  /* The trigger runs on the AC metric: the rolling standard deviation of the
+   * norm. It contains no DC term, so an imperfect baseline shifts `dev` but
+   * cannot move `acRms` at all — which is the whole point of the change. */
+  acRms = acPush(dev);
+
+  /* Track the baseline only while the machine is judged still, so a wash cycle
+   * can never drag it. Clamped so a transient cannot poison it. */
+  if (acRms < VIBE_THRESHOLD && acCount == AC_WINDOW) {
+    gravityBaseline += dev * baselineAlpha;
+    if (gravityBaseline < BASELINE_MIN_G) gravityBaseline = BASELINE_MIN_G;
+    if (gravityBaseline > BASELINE_MAX_G) gravityBaseline = BASELINE_MAX_G;
+  }
 
   const uint32_t now = millis();
 
-  if (vibeLevel > VIBE_THRESHOLD) {
+  /* Ignore the first window, before acRms means anything. */
+  if (acCount == AC_WINDOW && acRms > VIBE_THRESHOLD) {
     if (aboveSinceMs == 0) aboveSinceMs = now;
     lastActiveMs = now;
   } else {
@@ -638,7 +750,8 @@ static void takeSample() {
   }
 
   if (state == ST_LOGGING) {
-    if (mag > sessionPeakG) sessionPeakG = mag;
+    if (acRms > sessionPeakAc) sessionPeakAc = acRms;
+    if (fabsf(dev) > sessionPeakDev) sessionPeakDev = fabsf(dev);
 
     /* Flush early if the next line might not fit. */
     if (logBufLen + LINE_MAX > LOG_BUFFER_BYTES) {
@@ -650,11 +763,12 @@ static void takeSample() {
     }
 
     char *p = logBuf + logBufLen;
-    p += appendUInt32(p, now);      *p++ = ',';
-    p += appendFixed(p, ax,  4);    *p++ = ',';
-    p += appendFixed(p, ay,  4);    *p++ = ',';
-    p += appendFixed(p, az,  4);    *p++ = ',';
-    p += appendFixed(p, mag, 4);    *p++ = '\n';
+    p += appendUInt32(p, now);        *p++ = ',';
+    p += appendFixed(p, ax,    4);    *p++ = ',';
+    p += appendFixed(p, ay,    4);    *p++ = ',';
+    p += appendFixed(p, az,    4);    *p++ = ',';
+    p += appendFixed(p, dev,   4);    *p++ = ',';
+    p += appendFixed(p, acRms, 5);    *p++ = '\n';
     logBufLen = (size_t)(p - logBuf);
 
     nSamples++;
@@ -686,9 +800,9 @@ void setup() {
   Serial.println();
   Serial.println(F("=== WasherVibeLogger ==="));
   Serial.print(F("[CFG] rate="));            Serial.print(SAMPLE_RATE_HZ);
-  Serial.print(F(" Hz threshold="));         Serial.print(VIBE_THRESHOLD, 4);
-  Serial.print(F(" g quiet_timeout="));      Serial.print(QUIET_TIMEOUT_MS / 1000UL);
-  Serial.print(F(" s range=+/-"));           Serial.print(ACCEL_RANGE_G);
+  Serial.print(F(" Hz ac_threshold="));      Serial.print(VIBE_THRESHOLD * 1000.0f, 1);
+  Serial.print(F(" mg quiet_timeout="));     Serial.print(QUIET_TIMEOUT_MS / 60000UL);
+  Serial.print(F(" min range=+/-"));         Serial.print(ACCEL_RANGE_G);
   Serial.print(F(" g cs=D"));                Serial.println(SD_CS_PIN);
 
   /* Print the SPI mapping the core actually uses instead of trusting a pinout
@@ -745,11 +859,16 @@ void loop() {
 
     /* If an SD write overran the tick budget, skip the missed ticks instead of
      * firing a burst of catch-up samples with bogus timestamps. */
+    /* The (missed + 1) matters. Advancing by `missed` intervals leaves
+     * nextSampleUs at or just behind micros(), so the very next loop iteration
+     * fires again immediately — exactly the bug that put 27,122 samples (1.31%
+     * of the first study) 0-1 ms after their predecessor. The extra interval
+     * puts the deadline strictly in the future. */
     const int32_t behind = (int32_t)(micros() - nextSampleUs);
     if (behind >= (int32_t)sampleIntervalUs) {
       const uint32_t missed = (uint32_t)behind / sampleIntervalUs;
-      nDropped += missed;
-      nextSampleUs += missed * sampleIntervalUs;
+      nDropped += missed + 1;
+      nextSampleUs += (missed + 1) * sampleIntervalUs;
     }
 
     takeSample();
