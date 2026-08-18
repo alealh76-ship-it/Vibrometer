@@ -189,17 +189,22 @@ static void runProbe() {
   SPI.transfer(0xFF);
   SPI.endTransaction();
 
-  Serial.println();
-  Serial.println(F("MEASURE THIS BEFORE ANYTHING ELSE:"));
-  Serial.println(F("  VCC at the module's own pins, with a meter, powered up."));
-  Serial.println(F("  A '5V' module (AMS1117 regulator + 74LVC125 buffer, the"));
-  Serial.println(F("  common blue/HW-125 type) fed from 3V3 outputs only ~2.2 V"));
-  Serial.println(F("  to the card because of the regulator's dropout, and the"));
-  Serial.println(F("  card never enumerates. That failure is IDENTICAL across"));
-  Serial.println(F("  every module and card of that type. Feed VCC from the"));
-  Serial.println(F("  Nano's 5V pin instead (live when USB-powered)."));
-  Serial.println(F("  Then confirm MISO idles at ~3.3 V, NOT 5 V, before"));
-  Serial.println(F("  trusting it — this board is not 5 V tolerant."));
+  /* Only worth reading when the card did NOT answer. Printing a wall of
+   * power-supply advice after a successful probe made a pass look like a
+   * failure, which is the opposite of this sketch's job. */
+  if (r1 != 0x01) {
+    Serial.println();
+    Serial.println(F("MEASURE THIS BEFORE ANYTHING ELSE:"));
+    Serial.println(F("  VCC at the module's own pins, with a meter, powered up."));
+    Serial.println(F("  A '5V' module (AMS1117 regulator + 74LVC125 buffer, the"));
+    Serial.println(F("  common blue/HW-125 type) fed from 3V3 outputs only ~2.2 V"));
+    Serial.println(F("  to the card because of the regulator's dropout, and the"));
+    Serial.println(F("  card never enumerates. That failure is IDENTICAL across"));
+    Serial.println(F("  every module and card of that type. Feed VCC from the"));
+    Serial.println(F("  Nano's 5V pin instead (live when USB-powered)."));
+    Serial.println(F("  Then confirm MISO idles at ~3.3 V, NOT 5 V, before"));
+    Serial.println(F("  trusting it — this board is not 5 V tolerant."));
+  }
   Serial.println(F("=============================================="));
 }
 
