@@ -56,52 +56,22 @@ macros, so you never have to take this table on faith:
 
 Power is USB 5 V. Card must be FAT16/FAT32 formatted.
 
-### Optional: DS3231 real-time clock
-
-Off by default (`#define USE_DS3231 0`); the firmware builds and runs either way.
-
-| DS3231 | Nano 33 BLE Sense |
-|---|---|
-| SDA | A4 |
-| SCL | A5 |
-| VCC | 3V3 |
-| GND | GND |
-
-The onboard IMU sits on the **internal** I2C bus (`Wire1`), so an RTC on the
-A4/A5 header (`Wire`) shares nothing with it and adds no SPI pressure. Confirm
-against the boot banner before soldering.
-
-**Use a DS3231, not a DS1307.** The DS3231 is temperature-compensated (~1 min a
-year); the DS1307 drifts minutes per week, which defeats the point on a device
-nobody is watching.
-
-Talked to by register rather than through a library — the register map is tiny
-and fixed, so there is no Library Manager step and no API to mismatch. Register
-`0x0F` bit 7 is the oscillator-stop flag: if the backup cell is dead or missing,
-the stored time is garbage however plausible it looks, and the firmware says so
-and falls back to sequential filenames rather than writing a confident lie.
-
-**Why bother on a mains-powered rig.** Not for pretty filenames — because a
-power cut is otherwise *invisible*. `millis()` restarts near zero, and "the
-machine was idle for 40 minutes" becomes indistinguishable from "the board was
-off for 40 minutes". Those mean opposite things. With the RTC fitted, every boot
-is stamped in `BOOTLOG.CSV` and the blind window is the gap between that stamp
-and the last sample of the previous file. (For reference: across the first
-study the board ran 6.9 days without a single reset, so this is insurance rather
-than an active problem.)
-
-Set the clock once over USB, then walk away — it keeps time on its coin cell:
-
-```
-T2025-08-17 19:40:00
-```
+> **No clock on board.** Timestamps are relative to boot, so on a mains-powered
+> rig a power cut is invisible in the sample data: `millis()` restarts near zero,
+> and "the machine idled for 40 minutes" reads identically to "the board was off
+> for 40 minutes". `BOOTLOG.CSV` is the mitigation — see below. An RTC would fix
+> this properly if one turns up; the git history has a working DS3231 driver
+> (commit `6666789`) that can be restored in one revert.
 
 ## Serial commands
 
+The rig runs headless, so this exists for the bench session where a laptop
+happens to be attached. Plug in mid-run and read live state without rebooting —
+which would destroy the state you are asking about.
+
 | Command | Effect |
 |---|---|
-| `T2025-08-17 19:40:00` | set the RTC |
-| `?` | print state: time, IDLE/LOGGING, live AC value, baseline and whether it is provisional, uptime |
+| `?` | print state: IDLE/LOGGING, live AC value, baseline and whether it is provisional, uptime, current file |
 
 ## Build
 
@@ -127,15 +97,16 @@ is nothing to log without it.
 
 ## CSV output
 
-One file per cycle. With a trustworthy RTC the name is `MMDDHHMM.CSV`
-(`08171940.CSV`); the SD library's 8.3 short-name limit leaves exactly eight
-characters, so the year does not fit and is recorded in `BOOTLOG.CSV` instead.
-Without an RTC it falls back to `LOG0001.CSV`, `LOG0002.CSV`, … — the card root
-is scanned at session start and numbering continues from the highest existing
-file, so prior sessions are never overwritten either way.
+One file per cycle, `LOG0001.CSV`, `LOG0002.CSV`, … The card root is scanned at
+session start and numbering continues from the highest existing file, so prior
+sessions are never overwritten.
 
-`BOOTLOG.CSV` gets one line per boot: `datetime,rtc_ok,baseline_g,seed_quiet`.
-On an unattended rig this is the only record that an outage happened at all.
+`BOOTLOG.CSV` gets one line per boot: `next_log,baseline_g,seed_trusted`. With no
+clock a boot cannot be stamped with a time, but it *can* be stamped with its
+position in the log sequence — `next_log` is the number the next cycle will take,
+which brackets every boot between two files on the card. That is enough to tell
+"the machine idled" from "the board rebooted" when reading the logs back, and on
+an unattended rig it is the only record that an outage happened at all.
 
 ```
 millis,ax,ay,az,dev,ac
@@ -148,9 +119,8 @@ millis,ax,ay,az,dev,ac
 
 - `millis` — `millis()` at sample time, relative to **boot**, not to file start,
   and monotonic across every file in a boot, which is what makes sessions
-  stitchable. It stays the sample clock even with the RTC fitted: higher
-  resolution, and no I2C read per sample. Absolute time comes from the filename
-  and `BOOTLOG.CSV`.
+  stitchable. There is no RTC, so absolute wall-clock time is not recorded;
+  relative time within a session is what the analysis needs.
 - `ax/ay/az` — g, 4 decimals (`±4 g` range is ~0.000122 g/LSB, so 4 decimals is
   matched to the sensor).
 - `dev` — `sqrt(ax²+ay²+az²) − gravityBaseline`, in g. **Signed.** The old
@@ -205,7 +175,6 @@ All at the top of the `.ino`:
 | `FLUSH_EVERY_SAMPLES` / `FLUSH_INTERVAL_MS` | `200` / `10000` | buffer push / FAT flush cadence |
 | `AUTO_CALIBRATE_BASELINE` | `1` | set `0` to skip the boot seed |
 | `BASELINE_SNAP_QUIET_MS` | `5000` | continuous quiet needed before a provisional seed is snapped |
-| `USE_DS3231` | `0` | set `1` when the RTC is fitted |
 
 **Every default above that is not a round number was measured**, not guessed —
 see "What the first 12-log study changed" below.
